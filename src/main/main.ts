@@ -460,8 +460,11 @@ const runCommandStreaming = (
   sender: WebContents,
   outputStream: fs.WriteStream
 ) =>
-  new Promise<{ exitCode: number; cancelled: boolean; timedOut: boolean }>((resolve) => {
+  new Promise<{ exitCode: number; cancelled: boolean; timedOut: boolean; stdout: string; stderr: string }>(
+    (resolve) => {
     const child = spawn(command, args, { cwd: workspacePath });
+    let stdout = "";
+    let stderr = "";
     const timeoutId = setTimeout(() => {
       if (!activeRun || activeRun.runId !== runId) return;
       activeRun.timedOut = true;
@@ -485,6 +488,11 @@ const runCommandStreaming = (
 
     const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
       const text = chunk.toString();
+      if (source === "stdout") {
+        stdout += text;
+      } else {
+        stderr += text;
+      }
       outputStream.write(text);
       sender.send("run:output", { runId, source, text });
     };
@@ -499,7 +507,7 @@ const runCommandStreaming = (
       const cancelled = activeRun?.cancelled ?? false;
       const timedOut = activeRun?.timedOut ?? false;
       activeRun = null;
-      resolve({ exitCode: code ?? -1, cancelled, timedOut });
+      resolve({ exitCode: code ?? -1, cancelled, timedOut, stdout, stderr });
     });
 
     child.on("error", (error) => {
@@ -510,9 +518,10 @@ const runCommandStreaming = (
       const cancelled = activeRun?.cancelled ?? false;
       const timedOut = activeRun?.timedOut ?? false;
       activeRun = null;
-      resolve({ exitCode: -1, cancelled, timedOut });
+      resolve({ exitCode: -1, cancelled, timedOut, stdout, stderr });
     });
-  });
+  }
+  );
 
 const runExecutorCommand = (
   tool: string,
@@ -690,6 +699,7 @@ const registerIpc = () => {
     let timedOut = false;
     let cancelled = false;
     let cancelledByDecision = false;
+    let lastPrecheckHit = false;
 
     for (let index = 0; index < plan.steps.length; index += 1) {
       if (activePlan.cancelled) {
@@ -712,6 +722,7 @@ const registerIpc = () => {
         stepMeta.ended_at = new Date().toISOString();
         (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
         await writeRunMeta(runDir, runMeta);
+        lastPrecheckHit = false;
         continue;
       }
 
@@ -765,11 +776,36 @@ const registerIpc = () => {
         }
 
         const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
+        let changedFiles: string[] = [];
+        if (!("error" in evidence) && typeof evidence.git_diff_name_only === "string") {
+          changedFiles = parseNameOnly(evidence.git_diff_name_only);
+        }
+        const hasChanges = changedFiles.length > 0;
+        const evaluation: Record<string, unknown> = {
+          changed_files: changedFiles,
+          has_changes: hasChanges
+        };
+        if (result.exitCode === 0 && !hasChanges) {
+          evaluation.suspicious_no_change = true;
+        }
+        if (lastPrecheckHit && !hasChanges) {
+          evaluation.no_op = true;
+        }
+        stepMeta.evaluation = evaluation;
+        appendSystemLog(
+          event.sender,
+          runId,
+          outputStream,
+          `[evaluation] changed_files=${changedFiles.join(", ") || "(none)"} suspicious_no_change=${Boolean(
+            evaluation.suspicious_no_change
+          )} no_op=${Boolean(evaluation.no_op)}\n`
+        );
         stepMeta.evidence = evidence;
         runMeta.evidence = evidence;
         stepMeta.ended_at = new Date().toISOString();
         (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
         await writeRunMeta(runDir, runMeta);
+        lastPrecheckHit = false;
 
         if (result.cancelled || result.timedOut || result.exitCode !== 0) {
           break;
@@ -816,6 +852,10 @@ const registerIpc = () => {
       const parts = command.split(" ").filter(Boolean);
       const [bin, ...args] = parts;
       const result = await runCommandStreaming(bin, args, workspacePath, runId, event.sender, outputStream);
+      const stdout = result.stdout.trim();
+      const isPrecheck =
+        command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
+      lastPrecheckHit = isPrecheck && Boolean(stdout);
       stepMeta.exit_code = result.exitCode;
       stepMeta.cancelled = result.cancelled;
       stepMeta.timeout = result.timedOut;
