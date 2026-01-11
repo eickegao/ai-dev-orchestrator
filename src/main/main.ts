@@ -188,6 +188,42 @@ const formatZodError = (error: ZodError) =>
     })
     .join("; ");
 
+const extractJsonFromText = (rawText: string) => {
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    throw new Error("Planner output is empty");
+  }
+
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch?.[1]) {
+    return fenceMatch[1].trim();
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error("Planner output does not contain a JSON object");
+  }
+
+  return trimmed.slice(firstBrace, lastBrace + 1);
+};
+
+const normalizePlannerContent = (content: unknown): string => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && "text" in item && typeof item.text === "string") {
+          return item.text;
+        }
+        return "";
+      })
+      .join("");
+  }
+  return "";
+};
+
 const validateGeneratedPlan = (plan: TaskPlan) => {
   const issues: string[] = [];
 
@@ -253,19 +289,24 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
   }
 
   const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: { content?: unknown } }>;
   };
-  const content = data?.choices?.[0]?.message?.content?.trim();
-  if (!content) {
+  const rawText = normalizePlannerContent(data?.choices?.[0]?.message?.content);
+  if (!rawText) {
     throw new Error("OpenAI response missing content");
   }
 
+  const preview = rawText.slice(0, 200);
+  console.log(`[planner] raw output length: ${rawText.length}`);
+  console.log(`[planner] raw output preview: ${preview}`);
+
   let parsedJson: unknown;
   try {
-    parsedJson = JSON.parse(content);
+    const jsonText = extractJsonFromText(rawText);
+    parsedJson = JSON.parse(jsonText);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON from planner: ${message}`);
+    throw new Error(`Planner JSON parse error: ${message}; preview="${preview}"`);
   }
 
   try {
