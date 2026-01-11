@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld("api", {
   runGitStatus: async (workspacePath: string) =>
     ipcRenderer.invoke("run:git-status", workspacePath),
   cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),
+  submitDecision: async (payload: { runId: string; result: "approved" | "rejected" }) =>
+    ipcRenderer.invoke("run:decision", payload),
   getRunsRoot: async () => ipcRenderer.invoke("runs:root"),
   onRunOutput: (callback: (payload: { runId: string; source: string; text: string }) => void) => {
     const listener = (_event: unknown, payload: { runId: string; source: string; text: string }) => {
@@ -31,5 +33,12 @@ contextBridge.exposeInMainWorld("api", {
     };
     ipcRenderer.on("run:cancelled", listener);
     return () => ipcRenderer.removeListener("run:cancelled", listener);
+  },
+  onDecisionRequired: (callback: (payload: { runId: string; files: string[] }) => void) => {
+    const listener = (_event: unknown, payload: { runId: string; files: string[] }) => {
+      callback(payload);
+    };
+    ipcRenderer.on("run:decision", listener);
+    return () => ipcRenderer.removeListener("run:decision", listener);
   }
 });

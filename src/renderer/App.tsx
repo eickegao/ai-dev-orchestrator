@@ -6,6 +6,11 @@ type LogEntry = {
   source: "stdout" | "stderr" | "system";
 };
 
+type DecisionState = {
+  runId: string;
+  files: string[];
+};
+
 const App = () => {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
   const [runsRoot, setRunsRoot] = useState<string | null>(null);
@@ -14,6 +19,7 @@ const App = () => {
   ]);
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [decision, setDecision] = useState<DecisionState | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -37,6 +43,15 @@ const App = () => {
       appendLog({
         id: `${Date.now()}-error`,
         text: "Workspace not set.\n",
+        source: "system"
+      });
+      return;
+    }
+
+    if (decision) {
+      appendLog({
+        id: `${Date.now()}-decision-pending`,
+        text: "Decision required before running again.\n",
         source: "system"
       });
       return;
@@ -76,6 +91,25 @@ const App = () => {
     }
   };
 
+  const resolveDecision = async (result: "approved" | "rejected") => {
+    if (!decision) return;
+    const success = await window.api.submitDecision({ runId: decision.runId, result });
+    if (success) {
+      appendLog({
+        id: `${Date.now()}-decision-result`,
+        text: result === "approved" ? "[Approved by user]\n" : "[Rejected by user]\n",
+        source: result === "approved" ? "system" : "stderr"
+      });
+      setDecision(null);
+    } else {
+      appendLog({
+        id: `${Date.now()}-decision-fail`,
+        text: "Failed to record decision.\n",
+        source: "stderr"
+      });
+    }
+  };
+
   useEffect(() => {
     let isMounted = true;
     window.api.getRunsRoot().then((root) => {
@@ -110,11 +144,21 @@ const App = () => {
       setCurrentRunId(null);
     });
 
+    const unsubscribeDecision = window.api.onDecisionRequired((payload) => {
+      setDecision({ runId: payload.runId, files: payload.files });
+      appendLog({
+        id: `${Date.now()}-decision`,
+        text: `Dependency changes detected. Approval required.\n`,
+        source: "system"
+      });
+    });
+
     return () => {
       isMounted = false;
       unsubscribeOutput();
       unsubscribeDone();
       unsubscribeCancelled();
+      unsubscribeDecision();
     };
   }, []);
 
@@ -137,7 +181,7 @@ const App = () => {
           <button className="secondary" onClick={selectWorkspace}>
             Select Workspace
           </button>
-          <button className="primary" onClick={runGitStatus} disabled={isRunning}>
+          <button className="primary" onClick={runGitStatus} disabled={isRunning || !!decision}>
             Run git status
           </button>
           <button className="secondary" onClick={cancelRun} disabled={!isRunning}>
@@ -145,6 +189,27 @@ const App = () => {
           </button>
         </div>
       </header>
+
+      {decision && (
+        <section className="panel">
+          <h2>Decision Required</h2>
+          <p>检测到依赖变更，需要人工确认。</p>
+          <p>变更文件：</p>
+          <ul className="decision-list">
+            {decision.files.map((file) => (
+              <li key={file}>{file}</li>
+            ))}
+          </ul>
+          <div className="actions">
+            <button className="primary" onClick={() => resolveDecision("approved")}>
+              Approve
+            </button>
+            <button className="secondary" onClick={() => resolveDecision("rejected")}>
+              Reject
+            </button>
+          </div>
+        </section>
+      )}
 
       <section className="panel">
         <h2>Logs</h2>

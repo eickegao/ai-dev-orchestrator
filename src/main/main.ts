@@ -26,6 +26,12 @@ const createWindow = () => {
 
 const RUN_TIMEOUT_MS = 30_000;
 const ALLOWED_COMMAND_PREFIXES = ["git"];
+const DEPENDENCY_FILES = new Set([
+  "package.json",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml"
+]);
 
 const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrator", "data", "runs");
 
@@ -62,6 +68,7 @@ type ActiveRun = {
 };
 
 let activeRun: ActiveRun | null = null;
+const pendingDecisions = new Map<string, { runDir: string; files: string[] }>();
 
 const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
   await fs.promises.writeFile(
@@ -84,6 +91,24 @@ const terminateProcess = (child: ChildProcessWithoutNullStreams) => {
     }
   }, 3_000);
   child.once("exit", () => clearTimeout(killTimer));
+};
+
+const parseNameOnly = (value: string) =>
+  value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+const matchDependencyFiles = (files: string[]) => {
+  const matched = new Set<string>();
+  for (const file of files) {
+    for (const depFile of DEPENDENCY_FILES) {
+      if (file === depFile || file.endsWith(`/${depFile}`)) {
+        matched.add(file);
+      }
+    }
+  }
+  return Array.from(matched);
 };
 
 const runCommandCapture = (
@@ -158,6 +183,31 @@ const collectGitEvidence = async (
   return evidence;
 };
 
+const maybeRequestDecision = async (
+  evidence: Record<string, string> | { error: string },
+  runId: string,
+  runDir: string,
+  sender: WebContents,
+  outputStream: fs.WriteStream
+) => {
+  if ("error" in evidence) return;
+  const nameOnly = evidence.git_diff_name_only;
+  if (!nameOnly) return;
+
+  const changedFiles = parseNameOnly(nameOnly);
+  const dependencyFiles = matchDependencyFiles(changedFiles);
+  if (dependencyFiles.length === 0) return;
+
+  pendingDecisions.set(runId, { runDir, files: dependencyFiles });
+  appendSystemLog(
+    sender,
+    runId,
+    outputStream,
+    `Dependency changes detected. Awaiting approval: ${dependencyFiles.join(", ")}\n`
+  );
+  sender.send("run:decision", { runId, files: dependencyFiles });
+};
+
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -208,6 +258,7 @@ const registerIpc = () => {
         blocked_by_policy: true,
         evidence
       });
+      await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
       outputStream.end();
       event.sender.send("run:done", { runId, exitCode: -1 });
       return runId;
@@ -263,6 +314,7 @@ const registerIpc = () => {
       };
 
       await writeRunMeta(runDir, runMeta);
+      await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
 
       outputStream.end();
       event.sender.send("run:done", { runId, exitCode: code ?? -1 });
@@ -292,6 +344,7 @@ const registerIpc = () => {
       };
 
       await writeRunMeta(runDir, runMeta);
+      await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
 
       outputStream.end();
       event.sender.send("run:done", { runId, exitCode: -1 });
@@ -313,6 +366,25 @@ const registerIpc = () => {
     event.sender.send("run:cancelled", { runId });
     return true;
   });
+
+  ipcMain.handle(
+    "run:decision",
+    async (_event, payload: { runId: string; result: "approved" | "rejected" }) => {
+      const pending = pendingDecisions.get(payload.runId);
+      if (!pending) return false;
+      const runPath = path.join(pending.runDir, "run.json");
+      const existing = JSON.parse(await fs.promises.readFile(runPath, "utf-8"));
+      const decision = {
+        type: "dependency_change",
+        result: payload.result,
+        timestamp: new Date().toISOString(),
+        files: pending.files
+      };
+      await writeRunMeta(pending.runDir, { ...existing, decision });
+      pendingDecisions.delete(payload.runId);
+      return true;
+    }
+  );
 };
 
 app.whenReady().then(() => {
