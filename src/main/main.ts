@@ -59,19 +59,42 @@ const isGitRepo = async (workspacePath: string) => {
 const isCommandAllowed = (command: string) =>
   ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
 
-const PLAN_SYSTEM_PROMPT = [
-  "You are a software development task planner.",
-  "Output must be strict JSON and must not include markdown or extra text.",
-  "Schema:",
-  '{ "plan_name": string, "steps": [ { "type": "note", "message": string } | { "type": "cmd", "command": string } ] }',
-  "Constraints:",
-  '- step.type must be only "note" or "cmd".',
-  `- cmd.command must start with one of: ${ALLOWED_COMMAND_PREFIXES.join(", ") || "none"}.`,
-  "- no more than 8 steps.",
-  "- include at least 1 note step.",
-  '- the last step should be "git status -sb" or "git diff --stat" when possible.',
-  "Return JSON only."
-].join("\n");
+const PROMPT_RELATIVE_PATH = path.join("shared", "planner", "planner_system_prompt_v1.txt");
+const DIST_RELATIVE_PATH = path.join("dist", PROMPT_RELATIVE_PATH);
+const SRC_RELATIVE_PATH = path.join("src", PROMPT_RELATIVE_PATH);
+
+const loadPlannerSystemPrompt = async () => {
+  const basePaths = app.isPackaged ? [process.resourcesPath, __dirname] : [process.cwd()];
+  const attemptedPaths: string[] = [];
+
+  for (const base of basePaths) {
+    const distPath = path.join(base, DIST_RELATIVE_PATH);
+    attemptedPaths.push(distPath);
+    try {
+      const prompt = await fs.promises.readFile(distPath, "utf-8");
+      console.log(`[planner] system prompt loaded from: ${distPath}`);
+      console.log(`[planner] system prompt length: ${prompt.length}`);
+      return prompt;
+    } catch {
+      // try fallback
+    }
+
+    const srcPath = path.join(base, SRC_RELATIVE_PATH);
+    attemptedPaths.push(srcPath);
+    try {
+      const prompt = await fs.promises.readFile(srcPath, "utf-8");
+      console.log(`[planner] system prompt loaded from: ${srcPath}`);
+      console.log(`[planner] system prompt length: ${prompt.length}`);
+      return prompt;
+    } catch {
+      // try next base
+    }
+  }
+
+  throw new Error(
+    `Planner system prompt not found. Tried: ${attemptedPaths.join(", ")}`
+  );
+};
 
 type ActiveRun = {
   runId: string;
@@ -199,6 +222,7 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
     throw new Error("OPENAI_API_KEY is not set");
   }
 
+  const systemPrompt = await loadPlannerSystemPrompt();
   const response = await fetch(OPENAI_API_URL, {
     method: "POST",
     headers: {
@@ -209,7 +233,7 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
       model: OPENAI_MODEL,
       temperature: 0.2,
       messages: [
-        { role: "system", content: PLAN_SYSTEM_PROMPT },
+        { role: "system", content: systemPrompt },
         { role: "user", content: requirement.trim() }
       ]
     })

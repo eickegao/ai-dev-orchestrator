@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "dev": "concurrently -k \"tsc -p tsconfig.json --watch --preserveWatchOutput\" \"vite\" \"wait-on dist/main/main.js dist/main/preload.js tcp:5173 && electron .\"",
-    "build": "tsc -p tsconfig.json && vite build",
+    "build": "tsc -p tsconfig.json && vite build && node scripts/copy-planner-prompt.js",
     "preview": "vite preview"
   },
   "dependencies": {
