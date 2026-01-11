@@ -514,16 +514,16 @@ const runCommandStreaming = (
     });
   });
 
-const runExecutorStreaming = (
+const runExecutorCommand = (
   tool: string,
-  instructions: string,
+  args: string[],
   workspacePath: string,
   runId: string,
   sender: WebContents,
   outputStream: fs.WriteStream
 ) =>
   new Promise<{ exitCode: number; cancelled: boolean; timedOut: boolean; error?: string }>((resolve) => {
-    const child = spawn(tool, [], { cwd: workspacePath, detached: true });
+    const child = spawn(tool, args, { cwd: workspacePath, detached: true });
     const timeoutId = setTimeout(() => {
       if (!activeRun || activeRun.runId !== runId) return;
       activeRun.timedOut = true;
@@ -534,7 +534,7 @@ const runExecutorStreaming = (
     activeRun = {
       runId,
       workspacePath,
-      command: `executor:${tool}`,
+      command: `executor:${tool} ${args.join(" ")}`.trim(),
       startTime: new Date().toISOString(),
       runDir: "",
       outputStream,
@@ -554,15 +554,6 @@ const runExecutorStreaming = (
 
     child.stdout.on("data", (chunk) => sendChunk("stdout", chunk));
     child.stderr.on("data", (chunk) => sendChunk("stderr", chunk));
-
-    if (child.stdin) {
-      try {
-        child.stdin.write(`${instructions.trim()}\n`);
-        child.stdin.end();
-      } catch {
-        // ignore stdin write errors
-      }
-    }
 
     child.on("close", (code) => {
       if (activeRun?.runId === runId) {
@@ -586,6 +577,39 @@ const runExecutorStreaming = (
       resolve({ exitCode: -1, cancelled, timedOut, error: message });
     });
   });
+
+const runExecutorStreaming = async (
+  tool: string,
+  instructions: string,
+  workspacePath: string,
+  runId: string,
+  sender: WebContents,
+  outputStream: fs.WriteStream
+) => {
+  const execArgs = ["exec", "-C", workspacePath, "--full-auto", instructions.trim()];
+  const execResult = await runExecutorCommand(
+    tool,
+    execArgs,
+    workspacePath,
+    runId,
+    sender,
+    outputStream
+  );
+  if (execResult.exitCode !== 0 || execResult.cancelled || execResult.timedOut || execResult.error) {
+    return execResult;
+  }
+
+  const applyArgs = ["apply", "-C", workspacePath];
+  const applyResult = await runExecutorCommand(
+    tool,
+    applyArgs,
+    workspacePath,
+    runId,
+    sender,
+    outputStream
+  );
+  return applyResult;
+};
 
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
