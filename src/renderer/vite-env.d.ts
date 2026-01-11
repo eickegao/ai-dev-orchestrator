@@ -12,7 +12,7 @@ declare global {
         workspacePath: string;
         plan: {
           plan_name: string;
-          steps: Array<{ type: "cmd"; command: string } | { type: "note"; text: string }>;
+          steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }>;
         };
       }) => Promise<string>;
       cancelRun: (runId: string) => Promise<boolean>;

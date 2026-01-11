@@ -54,7 +54,7 @@ const isGitRepo = async (workspacePath: string) => {
 const isCommandAllowed = (command: string) =>
   ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
 
-type PlanStep = { type: "cmd"; command: string } | { type: "note"; text: string };
+type PlanStep = { type: "cmd"; command: string } | { type: "note"; message: string };
 type TaskPlan = { plan_name: string; steps: PlanStep[] };
 
 type ActiveRun = {
@@ -389,7 +389,7 @@ const registerIpc = () => {
       };
 
       if (step.type === "note") {
-        appendSystemLog(event.sender, runId, outputStream, `Note: ${step.text}\n`);
+        appendSystemLog(event.sender, runId, outputStream, `Note: ${step.message}\n`);
         stepMeta.ended_at = new Date().toISOString();
         (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
         await writeRunMeta(runDir, runMeta);

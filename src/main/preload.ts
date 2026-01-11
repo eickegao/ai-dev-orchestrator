@@ -7,7 +7,10 @@ contextBridge.exposeInMainWorld("appInfo", {
 
 contextBridge.exposeInMainWorld("api", {
   selectWorkspace: async () => ipcRenderer.invoke("workspace:select"),
-  runPlan: async (payload: { workspacePath: string; plan: { plan_name: string; steps: Array<{ type: "cmd"; command: string } | { type: "note"; text: string }> } }) =>
+  runPlan: async (payload: {
+    workspacePath: string;
+    plan: { plan_name: string; steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }> };
+  }) =>
     ipcRenderer.invoke("run:plan", payload),
   cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),
   submitDecision: async (payload: { runId: string; result: "approved" | "rejected" }) =>

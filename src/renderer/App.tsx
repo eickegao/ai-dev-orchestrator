@@ -11,13 +11,18 @@ type DecisionState = {
   files: string[];
 };
 
-const defaultPlan = {
+type TaskPlan = {
+  plan_name: string;
+  steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }>;
+};
+
+const defaultPlan: TaskPlan = {
   plan_name: "Default plan",
   steps: [
-    { type: "note", text: "Starting plan." },
+    { type: "note", message: "Starting plan." },
     { type: "cmd", command: "git status -sb" }
   ]
-} as const;
+};
 
 const App = () => {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
@@ -29,6 +34,8 @@ const App = () => {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [decision, setDecision] = useState<DecisionState | null>(null);
   const [stepProgress, setStepProgress] = useState<{ current: number; total: number } | null>(null);
+  const [planInput, setPlanInput] = useState(() => JSON.stringify(defaultPlan, null, 2));
+  const [planError, setPlanError] = useState<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -45,6 +52,31 @@ const App = () => {
         source: "system"
       });
     }
+  };
+
+  const parsePlan = (value: string): TaskPlan => {
+    const parsed = JSON.parse(value) as TaskPlan;
+    if (!parsed || typeof parsed.plan_name !== "string") {
+      throw new Error("plan_name must be a string");
+    }
+    if (!Array.isArray(parsed.steps)) {
+      throw new Error("steps must be an array");
+    }
+    for (const step of parsed.steps) {
+      if (!step || typeof step !== "object") {
+        throw new Error("step must be an object");
+      }
+      if (step.type !== "note" && step.type !== "cmd") {
+        throw new Error("step.type must be note or cmd");
+      }
+      if (step.type === "note" && typeof (step as { message?: string }).message !== "string") {
+        throw new Error("note step requires message:string");
+      }
+      if (step.type === "cmd" && typeof (step as { command?: string }).command !== "string") {
+        throw new Error("cmd step requires command:string");
+      }
+    }
+    return parsed;
   };
 
   const runPlan = async () => {
@@ -66,15 +98,25 @@ const App = () => {
       return;
     }
 
+    let plan: TaskPlan;
+    try {
+      plan = parsePlan(planInput);
+      setPlanError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setPlanError(message);
+      return;
+    }
+
     setIsRunning(true);
     appendLog({
       id: `${Date.now()}-run`,
-      text: `Running plan: ${defaultPlan.plan_name}\n`,
+      text: `Running plan: ${plan.plan_name}\n`,
       source: "system"
     });
 
     try {
-      const runId = await window.api.runPlan({ workspacePath, plan: defaultPlan });
+      const runId = await window.api.runPlan({ workspacePath, plan });
       setCurrentRunId(runId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -87,6 +129,11 @@ const App = () => {
       setCurrentRunId(null);
       setStepProgress(null);
     }
+  };
+
+  const resetPlan = () => {
+    setPlanInput(JSON.stringify(defaultPlan, null, 2));
+    setPlanError(null);
   };
 
   const cancelRun = async () => {
@@ -121,6 +168,11 @@ const App = () => {
   };
 
   useEffect(() => {
+    const storedPlan = window.localStorage.getItem("planEditor");
+    if (storedPlan) {
+      setPlanInput(storedPlan);
+    }
+
     let isMounted = true;
     window.api.getRunsRoot().then((root) => {
       if (isMounted) setRunsRoot(root);
@@ -180,6 +232,10 @@ const App = () => {
   }, []);
 
   useEffect(() => {
+    window.localStorage.setItem("planEditor", planInput);
+  }, [planInput]);
+
+  useEffect(() => {
     if (!logRef.current) return;
     logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logEntries]);
@@ -209,6 +265,22 @@ const App = () => {
           </button>
         </div>
       </header>
+
+      <section className="panel">
+        <h2>Plan JSON</h2>
+        <textarea
+          className="input"
+          value={planInput}
+          rows={10}
+          onChange={(event) => setPlanInput(event.target.value)}
+        />
+        {planError && <p className="error">{planError}</p>}
+        <div className="actions">
+          <button className="secondary" onClick={resetPlan}>
+            Use Default Plan
+          </button>
+        </div>
+      </section>
 
       {decision && (
         <section className="panel">

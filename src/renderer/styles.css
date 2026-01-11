@@ -116,3 +116,19 @@ button:disabled {
   padding-left: 18px;
   color: var(--muted);
 }
+
+.error {
+  margin: 0;
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+.input {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  font-family: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 13px;
+  min-height: 180px;
+}
