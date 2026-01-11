@@ -628,6 +628,11 @@ const buildRetryInstructions = () =>
     "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install."
   ].join(" ");
 
+const diffFromBaseline = (baseline: string[], current: string[]) => {
+  const baselineSet = new Set(baseline);
+  return current.filter((file) => !baselineSet.has(file));
+};
+
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -758,6 +763,16 @@ const registerIpc = () => {
           break;
         }
 
+        const baselineResult = await runCommandCapture(
+          "git",
+          ["diff", "--name-only"],
+          workspacePath
+        );
+        const baselineFiles =
+          baselineResult.code === 0 && baselineResult.stdout
+            ? parseNameOnly(baselineResult.stdout)
+            : [];
+
         let result = await runExecutorStreaming(
           tool,
           step.instructions,
@@ -774,12 +789,15 @@ const registerIpc = () => {
         }
 
         const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-        let changedFiles: string[] = [];
+        let currentFiles: string[] = [];
         if (!("error" in evidence) && typeof evidence.git_diff_name_only === "string") {
-          changedFiles = parseNameOnly(evidence.git_diff_name_only);
+          currentFiles = parseNameOnly(evidence.git_diff_name_only);
         }
+        const changedFiles = diffFromBaseline(baselineFiles, currentFiles);
         const hasChanges = changedFiles.length > 0;
         const evaluation: Record<string, unknown> = {
+          baseline_files: baselineFiles,
+          current_files: currentFiles,
           changed_files: changedFiles,
           has_changes: hasChanges,
           retried: false
@@ -825,12 +843,16 @@ const registerIpc = () => {
             ["diff", "--name-only"],
             workspacePath
           );
+          let retryCurrent: string[] = [];
           if (retryDiff.code === 0 && retryDiff.stdout) {
-            retryChanged = parseNameOnly(retryDiff.stdout);
+            retryCurrent = parseNameOnly(retryDiff.stdout);
           }
+          retryChanged = diffFromBaseline(baselineFiles, retryCurrent);
           const retryHasChanges = retryChanged.length > 0;
           evaluation.retry_result = {
             exit_code: retryResult.exitCode,
+            baseline_files: baselineFiles,
+            current_files: retryCurrent,
             changed_files: retryChanged,
             has_changes: retryHasChanges
           };
