@@ -86,6 +86,78 @@ const terminateProcess = (child: ChildProcessWithoutNullStreams) => {
   child.once("exit", () => clearTimeout(killTimer));
 };
 
+const runCommandCapture = (
+  command: string,
+  args: string[],
+  cwd: string
+): Promise<{ code: number; stdout: string; stderr: string; error?: string }> =>
+  new Promise((resolve) => {
+    const child = spawn(command, args, { cwd });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      resolve({ code: -1, stdout, stderr, error: error.message });
+    });
+
+    child.on("close", (code) => {
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
+  });
+
+const collectGitEvidence = async (
+  workspacePath: string,
+  sender: WebContents,
+  runId: string,
+  outputStream: fs.WriteStream
+) => {
+  if (!isCommandAllowed("git")) {
+    const message = "Command not allowed by policy";
+    appendSystemLog(sender, runId, outputStream, `--- evidence ---\n${message}\n`);
+    return { error: message };
+  }
+
+  const commands = [
+    { key: "git_status_porcelain", args: ["status", "--porcelain"], label: "git status --porcelain" },
+    { key: "git_diff_stat", args: ["diff", "--stat"], label: "git diff --stat" },
+    { key: "git_diff_name_only", args: ["diff", "--name-only"], label: "git diff --name-only" }
+  ];
+
+  const evidence: Record<string, string> = {};
+
+  for (const command of commands) {
+    const result = await runCommandCapture("git", command.args, workspacePath);
+    if (result.code !== 0) {
+      const reason = result.error ?? result.stderr.trim() ?? `exit code ${result.code}`;
+      const message = `${command.label} failed: ${reason}`;
+      appendSystemLog(sender, runId, outputStream, `--- evidence ---\n${message}\n`);
+      return { error: message };
+    }
+    evidence[command.key] = result.stdout;
+  }
+
+  const evidenceLog = [
+    "--- evidence ---",
+    "git diff --stat:",
+    evidence.git_diff_stat || "(no changes)",
+    "git status --porcelain:",
+    evidence.git_status_porcelain || "(clean)",
+    "git diff --name-only:",
+    evidence.git_diff_name_only || "(no changes)",
+    ""
+  ].join("\n");
+
+  appendSystemLog(sender, runId, outputStream, evidenceLog);
+  return evidence;
+};
+
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -125,6 +197,7 @@ const registerIpc = () => {
     if (!isCommandAllowed(command)) {
       appendSystemLog(event.sender, runId, outputStream, "Command not allowed by policy\n");
       const endTime = new Date().toISOString();
+      const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
       await writeRunMeta(runDir, {
         run_id: runId,
         workspacePath,
@@ -132,7 +205,8 @@ const registerIpc = () => {
         startTime,
         endTime,
         exitCode: -1,
-        blocked_by_policy: true
+        blocked_by_policy: true,
+        evidence
       });
       outputStream.end();
       event.sender.send("run:done", { runId, exitCode: -1 });
@@ -174,8 +248,8 @@ const registerIpc = () => {
       if (activeRun?.runId === runId) {
         clearTimeout(activeRun.timeoutId);
       }
-      outputStream.end();
 
+      const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
       const runMeta = {
         run_id: runId,
         workspacePath,
@@ -184,11 +258,13 @@ const registerIpc = () => {
         endTime,
         exitCode: code ?? -1,
         cancelled: activeRun?.cancelled ?? false,
-        timeout: activeRun?.timedOut ?? false
+        timeout: activeRun?.timedOut ?? false,
+        evidence
       };
 
       await writeRunMeta(runDir, runMeta);
 
+      outputStream.end();
       event.sender.send("run:done", { runId, exitCode: code ?? -1 });
       if (activeRun?.runId === runId) {
         activeRun = null;
@@ -200,8 +276,8 @@ const registerIpc = () => {
       if (activeRun?.runId === runId) {
         clearTimeout(activeRun.timeoutId);
       }
-      outputStream.end();
 
+      const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
       const runMeta = {
         run_id: runId,
         workspacePath,
@@ -211,11 +287,13 @@ const registerIpc = () => {
         exitCode: -1,
         error: error.message,
         cancelled: activeRun?.cancelled ?? false,
-        timeout: activeRun?.timedOut ?? false
+        timeout: activeRun?.timedOut ?? false,
+        evidence
       };
 
       await writeRunMeta(runDir, runMeta);
 
+      outputStream.end();
       event.sender.send("run:done", { runId, exitCode: -1 });
       if (activeRun?.runId === runId) {
         activeRun = null;
