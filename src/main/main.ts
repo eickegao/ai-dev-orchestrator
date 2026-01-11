@@ -1115,24 +1115,30 @@ const runPlanInternal = async (
 
     const parts = command.split(" ").filter(Boolean);
     const [bin, ...args] = parts;
-    const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
-    const stdout = result.stdout.trim();
-    const isPrecheck =
-      command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
-    lastPrecheckHit = isPrecheck && Boolean(stdout);
-    stepMeta.exit_code = result.exitCode;
-    stepMeta.cancelled = result.cancelled;
-    stepMeta.timeout = result.timedOut;
+      const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
+      const stdout = result.stdout.trim();
+      const isGrep = command.startsWith("git grep");
+      const isGrepNoMatch = isGrep && result.exitCode === 1;
+      const effectiveExitCode = isGrepNoMatch ? 0 : result.exitCode;
+      if (isGrepNoMatch) {
+        appendSystemLog(sender, runId, outputStream, "[precheck] no matches\n");
+      }
+      const isPrecheck =
+        command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
+      lastPrecheckHit = isPrecheck && Boolean(stdout);
+      stepMeta.exit_code = result.exitCode;
+      stepMeta.cancelled = result.cancelled;
+      stepMeta.timeout = result.timedOut;
 
-    if (result.cancelled) {
-      cancelled = true;
-      lastExitCode = result.exitCode;
-    } else if (result.timedOut) {
-      timedOut = true;
-      lastExitCode = result.exitCode;
-    } else {
-      lastExitCode = result.exitCode;
-    }
+      if (result.cancelled) {
+        cancelled = true;
+        lastExitCode = effectiveExitCode;
+      } else if (result.timedOut) {
+        timedOut = true;
+        lastExitCode = effectiveExitCode;
+      } else {
+        lastExitCode = effectiveExitCode;
+      }
 
     const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
     stepMeta.evidence = evidence;
@@ -1141,9 +1147,9 @@ const runPlanInternal = async (
     (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
     await writeRunMeta(runDir, runMeta);
 
-    if (result.cancelled || result.timedOut || result.exitCode !== 0) {
-      break;
-    }
+      if (result.cancelled || result.timedOut || effectiveExitCode !== 0) {
+        break;
+      }
 
     const decisionResult = await maybeRequestDecision(
       evidence,
