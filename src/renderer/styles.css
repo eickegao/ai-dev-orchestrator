@@ -1,0 +1,112 @@
+:root {
+  color-scheme: light;
+  font-family: "IBM Plex Sans", "SF Pro Text", system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  background: #f3f4f6;
+  color: #1f2937;
+
+  --panel-bg: #ffffff;
+  --panel-border: #d6d8dd;
+  --accent: #2563eb;
+  --accent-soft: #e0ecff;
+  --muted: #4b5563;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(160deg, #f9fafb 0%, #eef2f7 100%);
+}
+
+.app {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 28px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.app__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--panel-bg);
+  padding: 18px 20px;
+  border-radius: 14px;
+  border: 1px solid var(--panel-border);
+}
+
+.app__header h1 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.muted {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+button {
+  border: none;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  color: white;
+}
+
+button.secondary {
+  background: var(--accent-soft);
+  color: #1e3a8a;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.log {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 14px;
+  border-radius: 10px;
+  min-height: 200px;
+  max-height: 380px;
+  overflow: auto;
+  font-family: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
