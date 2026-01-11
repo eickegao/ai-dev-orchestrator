@@ -4,7 +4,9 @@ The JSON MUST conform to this schema:
 {
   "plan_name": string,
   "steps": [
-    { "type": "note", "message": string } | { "type": "cmd", "command": string }
+    { "type": "note", "message": string }
+    | { "type": "cmd", "command": string }
+    | { "type": "executor", "tool": "codex" | "claude_code", "instructions": string }
   ]
 }
 
@@ -17,9 +19,15 @@ Constraints:
 - The last two steps MUST be these cmd steps in order:
   1) "git diff --stat"
   2) "git status --porcelain"
-- If the requirement implies UI/code changes, include at least one note that:
-  - names the specific file path(s) to edit (prefer: src/renderer/App.tsx for UI work),
-  - states the exact action to implement (concrete behavior, not vague).
+- If the requirement implies code changes, prefer an executor step as steps[1] with:
+  - type: "executor", tool: "codex"
+  - instructions must include:
+    - specific file path(s) to edit (prefer: src/renderer/App.tsx for UI work)
+    - concrete implementation actions
+    - "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install"
+    - limit scope (e.g. "ONLY edit src/renderer/App.tsx")
+  - instructions must be concise (<= 600 chars)
+- If the requirement is only inspection/info (no code changes), do not include executor; use note/cmd only.
 - If uncertain, still return a minimal valid plan with a note and the required evidence commands.
 
 Return JSON only.
