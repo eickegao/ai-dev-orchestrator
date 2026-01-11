@@ -8,6 +8,7 @@ type LogEntry = {
 
 const App = () => {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
+  const [runsRoot, setRunsRoot] = useState<string | null>(null);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([
     { id: "boot", text: "Ready.\n", source: "system" }
   ]);
@@ -61,6 +62,11 @@ const App = () => {
   };
 
   useEffect(() => {
+    let isMounted = true;
+    window.api.getRunsRoot().then((root) => {
+      if (isMounted) setRunsRoot(root);
+    });
+
     const unsubscribeOutput = window.api.onRunOutput((payload) => {
       appendLog({
         id: `${Date.now()}-${Math.random()}`,
@@ -79,6 +85,7 @@ const App = () => {
     });
 
     return () => {
+      isMounted = false;
       unsubscribeOutput();
       unsubscribeDone();
     };
@@ -97,6 +104,7 @@ const App = () => {
         <div>
           <h1>AI Dev Orchestrator</h1>
           <p className="muted">Workspace: {workspacePath ?? "(not set)"}</p>
+          <p className="muted">Runs: {runsRoot ?? "(loading...)"}</p>
         </div>
         <div className="actions">
           <button className="secondary" onClick={selectWorkspace}>

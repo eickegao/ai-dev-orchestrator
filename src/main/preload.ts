@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("api", {
   selectWorkspace: async () => ipcRenderer.invoke("workspace:select"),
   runGitStatus: async (workspacePath: string) =>
     ipcRenderer.invoke("run:git-status", workspacePath),
+  getRunsRoot: async () => ipcRenderer.invoke("runs:root"),
   onRunOutput: (callback: (payload: { runId: string; source: string; text: string }) => void) => {
     const listener = (_event: unknown, payload: { runId: string; source: string; text: string }) => {
       callback(payload);

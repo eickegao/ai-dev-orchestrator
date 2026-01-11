@@ -24,8 +24,10 @@ const createWindow = () => {
   }
 };
 
+const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrator", "data", "runs");
+
 const ensureRunDir = async (runId: string) => {
-  const baseDir = path.join(app.getAppPath(), "data", "runs", runId);
+  const baseDir = path.join(getRunsRoot(), runId);
   await fs.promises.mkdir(baseDir, { recursive: true });
   return baseDir;
 };
@@ -51,6 +53,12 @@ const registerIpc = () => {
     }
 
     return result.filePaths[0];
+  });
+
+  ipcMain.handle("runs:root", async () => {
+    const runsRoot = getRunsRoot();
+    await fs.promises.mkdir(runsRoot, { recursive: true });
+    return runsRoot;
   });
 
   ipcMain.handle("run:git-status", async (event, workspacePath: string) => {
