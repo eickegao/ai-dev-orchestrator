@@ -13,6 +13,7 @@ const App = () => {
     { id: "boot", text: "Ready.\n", source: "system" }
   ]);
   const [isRunning, setIsRunning] = useState(false);
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -49,7 +50,8 @@ const App = () => {
     });
 
     try {
-      await window.api.runGitStatus(workspacePath);
+      const runId = await window.api.runGitStatus(workspacePath);
+      setCurrentRunId(runId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       appendLog({
@@ -58,6 +60,19 @@ const App = () => {
         source: "system"
       });
       setIsRunning(false);
+      setCurrentRunId(null);
+    }
+  };
+
+  const cancelRun = async () => {
+    if (!currentRunId) return;
+    const cancelled = await window.api.cancelRun(currentRunId);
+    if (!cancelled) {
+      appendLog({
+        id: `${Date.now()}-cancel-failed`,
+        text: "Cancel failed (no active run).\n",
+        source: "system"
+      });
     }
   };
 
@@ -71,7 +86,7 @@ const App = () => {
       appendLog({
         id: `${Date.now()}-${Math.random()}`,
         text: payload.text,
-        source: payload.source === "stderr" ? "stderr" : "stdout"
+        source: payload.source
       });
     });
 
@@ -82,12 +97,24 @@ const App = () => {
         source: payload.exitCode === 0 ? "system" : "stderr"
       });
       setIsRunning(false);
+      setCurrentRunId(null);
+    });
+
+    const unsubscribeCancelled = window.api.onRunCancelled((payload) => {
+      appendLog({
+        id: `${Date.now()}-cancelled`,
+        text: `Run ${payload.runId} cancelled.\n`,
+        source: "system"
+      });
+      setIsRunning(false);
+      setCurrentRunId(null);
     });
 
     return () => {
       isMounted = false;
       unsubscribeOutput();
       unsubscribeDone();
+      unsubscribeCancelled();
     };
   }, []);
 
@@ -112,6 +139,9 @@ const App = () => {
           </button>
           <button className="primary" onClick={runGitStatus} disabled={isRunning}>
             Run git status
+          </button>
+          <button className="secondary" onClick={cancelRun} disabled={!isRunning}>
+            Cancel
           </button>
         </div>
       </header>

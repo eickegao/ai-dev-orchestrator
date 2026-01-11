@@ -1,8 +1,8 @@
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, type WebContents } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 const createWindow = () => {
   const window = new BrowserWindow({
@@ -24,6 +24,9 @@ const createWindow = () => {
   }
 };
 
+const RUN_TIMEOUT_MS = 30_000;
+const ALLOWED_COMMAND_PREFIXES = ["git"];
+
 const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrator", "data", "runs");
 
 const ensureRunDir = async (runId: string) => {
@@ -40,6 +43,47 @@ const isGitRepo = async (workspacePath: string) => {
   } catch {
     return false;
   }
+};
+
+const isCommandAllowed = (command: string) =>
+  ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
+
+type ActiveRun = {
+  runId: string;
+  workspacePath: string;
+  command: string;
+  startTime: string;
+  runDir: string;
+  outputStream: fs.WriteStream;
+  child: ChildProcessWithoutNullStreams;
+  timeoutId: NodeJS.Timeout;
+  cancelled: boolean;
+  timedOut: boolean;
+};
+
+let activeRun: ActiveRun | null = null;
+
+const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
+  await fs.promises.writeFile(
+    path.join(runDir, "run.json"),
+    JSON.stringify(meta, null, 2),
+    "utf-8"
+  );
+};
+
+const appendSystemLog = (sender: WebContents, runId: string, outputStream: fs.WriteStream, text: string) => {
+  outputStream.write(text);
+  sender.send("run:output", { runId, source: "system", text });
+};
+
+const terminateProcess = (child: ChildProcessWithoutNullStreams) => {
+  child.kill("SIGTERM");
+  const killTimer = setTimeout(() => {
+    if (!child.killed) {
+      child.kill("SIGKILL");
+    }
+  }, 3_000);
+  child.once("exit", () => clearTimeout(killTimer));
 };
 
 const registerIpc = () => {
@@ -78,7 +122,43 @@ const registerIpc = () => {
     const outputPath = path.join(runDir, "output.log");
     const outputStream = fs.createWriteStream(outputPath, { flags: "a" });
 
+    if (!isCommandAllowed(command)) {
+      appendSystemLog(event.sender, runId, outputStream, "Command not allowed by policy\n");
+      const endTime = new Date().toISOString();
+      await writeRunMeta(runDir, {
+        run_id: runId,
+        workspacePath,
+        command,
+        startTime,
+        endTime,
+        exitCode: -1,
+        blocked_by_policy: true
+      });
+      outputStream.end();
+      event.sender.send("run:done", { runId, exitCode: -1 });
+      return runId;
+    }
+
     const child = spawn("git", ["status", "-sb"], { cwd: workspacePath });
+    const timeoutId = setTimeout(() => {
+      if (!activeRun || activeRun.runId !== runId) return;
+      activeRun.timedOut = true;
+      appendSystemLog(event.sender, runId, outputStream, "[Timeout exceeded]\n");
+      terminateProcess(child);
+    }, RUN_TIMEOUT_MS);
+
+    activeRun = {
+      runId,
+      workspacePath,
+      command,
+      startTime,
+      runDir,
+      outputStream,
+      child,
+      timeoutId,
+      cancelled: false,
+      timedOut: false
+    };
 
     const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
       const text = chunk.toString();
@@ -91,6 +171,9 @@ const registerIpc = () => {
 
     child.on("close", async (code) => {
       const endTime = new Date().toISOString();
+      if (activeRun?.runId === runId) {
+        clearTimeout(activeRun.timeoutId);
+      }
       outputStream.end();
 
       const runMeta = {
@@ -99,20 +182,24 @@ const registerIpc = () => {
         command,
         startTime,
         endTime,
-        exitCode: code ?? -1
+        exitCode: code ?? -1,
+        cancelled: activeRun?.cancelled ?? false,
+        timeout: activeRun?.timedOut ?? false
       };
 
-      await fs.promises.writeFile(
-        path.join(runDir, "run.json"),
-        JSON.stringify(runMeta, null, 2),
-        "utf-8"
-      );
+      await writeRunMeta(runDir, runMeta);
 
       event.sender.send("run:done", { runId, exitCode: code ?? -1 });
+      if (activeRun?.runId === runId) {
+        activeRun = null;
+      }
     });
 
     child.on("error", async (error) => {
       const endTime = new Date().toISOString();
+      if (activeRun?.runId === runId) {
+        clearTimeout(activeRun.timeoutId);
+      }
       outputStream.end();
 
       const runMeta = {
@@ -122,19 +209,31 @@ const registerIpc = () => {
         startTime,
         endTime,
         exitCode: -1,
-        error: error.message
+        error: error.message,
+        cancelled: activeRun?.cancelled ?? false,
+        timeout: activeRun?.timedOut ?? false
       };
 
-      await fs.promises.writeFile(
-        path.join(runDir, "run.json"),
-        JSON.stringify(runMeta, null, 2),
-        "utf-8"
-      );
+      await writeRunMeta(runDir, runMeta);
 
       event.sender.send("run:done", { runId, exitCode: -1 });
+      if (activeRun?.runId === runId) {
+        activeRun = null;
+      }
     });
 
     return runId;
+  });
+
+  ipcMain.handle("run:cancel", async (event, runId: string) => {
+    if (!activeRun || activeRun.runId !== runId) {
+      return false;
+    }
+    activeRun.cancelled = true;
+    appendSystemLog(event.sender, runId, activeRun.outputStream, "[Cancelled by user]\n");
+    terminateProcess(activeRun.child);
+    event.sender.send("run:cancelled", { runId });
+    return true;
   });
 };
 

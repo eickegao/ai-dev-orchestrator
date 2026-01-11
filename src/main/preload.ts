@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("api", {
   selectWorkspace: async () => ipcRenderer.invoke("workspace:select"),
   runGitStatus: async (workspacePath: string) =>
     ipcRenderer.invoke("run:git-status", workspacePath),
+  cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),
   getRunsRoot: async () => ipcRenderer.invoke("runs:root"),
   onRunOutput: (callback: (payload: { runId: string; source: string; text: string }) => void) => {
     const listener = (_event: unknown, payload: { runId: string; source: string; text: string }) => {
@@ -23,5 +24,12 @@ contextBridge.exposeInMainWorld("api", {
     };
     ipcRenderer.on("run:done", listener);
     return () => ipcRenderer.removeListener("run:done", listener);
+  },
+  onRunCancelled: (callback: (payload: { runId: string }) => void) => {
+    const listener = (_event: unknown, payload: { runId: string }) => {
+      callback(payload);
+    };
+    ipcRenderer.on("run:cancelled", listener);
+    return () => ipcRenderer.removeListener("run:cancelled", listener);
   }
 });
