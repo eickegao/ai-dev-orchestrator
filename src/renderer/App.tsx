@@ -34,12 +34,22 @@ const App = () => {
   const [planError, setPlanError] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isAutobuilding, setIsAutobuilding] = useState(false);
+  const [autobuildStatus, setAutobuildStatus] = useState<{
+    iteration: number;
+    phase: "planning" | "running" | "done";
+    message: string;
+  } | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
     setLogEntries((prev) => [...prev, entry]);
+  };
+
+  const clearLogs = () => {
+    setLogEntries([]);
   };
 
   const selectWorkspace = async () => {
@@ -168,19 +178,72 @@ const App = () => {
     }
   };
 
-  const cancelRun = async () => {
-    if (!currentRunId) return;
+  const startAutobuild = async () => {
+    if (!workspacePath) {
+      appendLog({
+        id: `${Date.now()}-autobuild-workspace`,
+        text: "Workspace not set.\n",
+        source: "system"
+      });
+      return;
+    }
+    if (!requirement.trim()) {
+      appendLog({
+        id: `${Date.now()}-autobuild-requirement`,
+        text: "Requirement is empty.\n",
+        source: "system"
+      });
+      return;
+    }
+    if (decision) {
+      appendLog({
+        id: `${Date.now()}-autobuild-decision`,
+        text: "Decision required before running autobuild.\n",
+        source: "system"
+      });
+      return;
+    }
     if (!window.api) {
       setApiError("preload not loaded, IPC unavailable");
       return;
     }
-    const cancelled = await window.api.cancelRun(currentRunId);
-    if (!cancelled) {
+
+    setIsAutobuilding(true);
+    setAutobuildStatus(null);
+    try {
+      await window.api.startAutobuild({
+        workspace: workspacePath,
+        requirement,
+        maxIterations: 2
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       appendLog({
-        id: `${Date.now()}-cancel-failed`,
-        text: "Cancel failed (no active run).\n",
+        id: `${Date.now()}-autobuild-error`,
+        text: `Autobuild failed: ${message}\n`,
         source: "system"
       });
+      setIsAutobuilding(false);
+    }
+  };
+
+  const cancelRun = async () => {
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
+    if (isAutobuilding) {
+      await window.api.cancelAutobuild();
+    }
+    if (currentRunId) {
+      const cancelled = await window.api.cancelRun(currentRunId);
+      if (!cancelled) {
+        appendLog({
+          id: `${Date.now()}-cancel-failed`,
+          text: "Cancel failed (no active run).\n",
+          source: "system"
+        });
+      }
     }
   };
 
@@ -271,6 +334,36 @@ const App = () => {
       });
     });
 
+    const unsubscribeAutobuildStatus = window.api.onAutobuildStatus((payload) => {
+      setAutobuildStatus(payload);
+      appendLog({
+        id: `${Date.now()}-autobuild-status`,
+        text: `[autobuild] iter ${payload.iteration} ${payload.phase}: ${payload.message}\n`,
+        source: "system"
+      });
+    });
+
+    const unsubscribeAutobuildPlan = window.api.onAutobuildPlan((payload) => {
+      setPlanInput(JSON.stringify(payload.plan, null, 2));
+      appendLog({
+        id: `${Date.now()}-autobuild-plan`,
+        text: `[autobuild] received plan for iteration ${payload.iteration}\n`,
+        source: "system"
+      });
+    });
+
+    const unsubscribeAutobuildDone = window.api.onAutobuildDone((payload) => {
+      setAutobuildStatus((prev) =>
+        prev ? { ...prev, phase: "done", message: `Stopped: ${payload.stop_reason}` } : prev
+      );
+      appendLog({
+        id: `${Date.now()}-autobuild-done`,
+        text: `[autobuild] done after ${payload.iterations_run} iteration(s): ${payload.stop_reason}\n`,
+        source: "system"
+      });
+      setIsAutobuilding(false);
+    });
+
     return () => {
       isMounted = false;
       unsubscribeOutput();
@@ -278,6 +371,9 @@ const App = () => {
       unsubscribeStep();
       unsubscribeCancelled();
       unsubscribeDecision();
+      unsubscribeAutobuildStatus();
+      unsubscribeAutobuildPlan();
+      unsubscribeAutobuildDone();
     };
   }, []);
 
@@ -307,6 +403,12 @@ const App = () => {
             Step: {stepProgress ? `${stepProgress.current}/${stepProgress.total}` : "(idle)"}
           </p>
           <p className="muted">
+            Auto Build:{" "}
+            {autobuildStatus
+              ? `iter ${autobuildStatus.iteration} (${autobuildStatus.phase})`
+              : "(idle)"}
+          </p>
+          <p className="muted">
             Requirement: {requirement.trim() ? requirement.trim().slice(0, 80) : "(not set)"}
           </p>
           {apiError && <p className="error">{apiError}</p>}
@@ -315,10 +417,17 @@ const App = () => {
           <button className="secondary" onClick={selectWorkspace}>
             Select Workspace
           </button>
+          <button
+            className="primary"
+            onClick={startAutobuild}
+            disabled={isRunning || isAutobuilding || !!decision}
+          >
+            Auto Build (2x)
+          </button>
           <button className="primary" onClick={runPlan} disabled={isRunning || !!decision}>
             Run Plan
           </button>
-          <button className="secondary" onClick={cancelRun} disabled={!isRunning}>
+          <button className="secondary" onClick={cancelRun} disabled={!isRunning && !isAutobuilding}>
             Cancel
           </button>
         </div>
@@ -387,6 +496,11 @@ const App = () => {
 
       <section className="panel">
         <h2>Logs</h2>
+        <div className="actions">
+          <button className="secondary" onClick={clearLogs} disabled={!logEntries.length}>
+            Clear Logs
+          </button>
+        </div>
         <pre className="log" ref={logRef}>
           {logText || "No logs yet."}
         </pre>

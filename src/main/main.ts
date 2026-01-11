@@ -258,6 +258,8 @@ type DecisionWaiter = {
 
 let activeRun: ActiveRun | null = null;
 let activePlan: ActivePlan | null = null;
+let autobuildActive = false;
+let autobuildCancelled = false;
 const pendingDecisions = new Map<string, DecisionWaiter>();
 
 const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
@@ -568,8 +570,9 @@ const maybeRequestDecision = async (
   runId: string,
   runDir: string,
   sender: WebContents,
-  outputStream: fs.WriteStream
-): Promise<"approved" | "rejected" | null> => {
+  outputStream: fs.WriteStream,
+  options: { awaitDecision: boolean }
+): Promise<"approved" | "rejected" | "pending" | null> => {
   if ("error" in evidence) return null;
   const nameOnly = evidence.git_diff_name_only;
   if (!nameOnly) return null;
@@ -585,6 +588,11 @@ const maybeRequestDecision = async (
     `Dependency changes detected. Awaiting approval: ${dependencyFiles.join(", ")}\n`
   );
   sender.send("run:decision", { runId, files: dependencyFiles });
+
+  if (!options.awaitDecision) {
+    pendingDecisions.set(runId, { runDir, files: dependencyFiles, resolve: () => {} });
+    return "pending";
+  }
 
   return new Promise((resolve) => {
     pendingDecisions.set(runId, { runDir, files: dependencyFiles, resolve });
@@ -772,6 +780,425 @@ const diffFromBaseline = (baseline: string[], current: string[]) => {
   return current.filter((file) => !baselineSet.has(file));
 };
 
+type RunPlanResult = {
+  runId: string;
+  exitCode: number;
+  cancelled: boolean;
+  cancelledByDecision: boolean;
+  blockedByPolicy: boolean;
+  timedOut: boolean;
+  decisionPending: boolean;
+  lastExecutorEvaluation: Record<string, unknown> | null;
+};
+
+const runPlanInternal = async (
+  sender: WebContents,
+  payload: { workspacePath: string; plan: TaskPlan; requirement?: string },
+  options: { awaitDecision: boolean }
+): Promise<RunPlanResult> => {
+  if (activePlan) {
+    throw new Error("Another run is already active");
+  }
+
+  const { workspacePath, plan, requirement } = payload;
+  if (!workspacePath) {
+    throw new Error("Workspace not set");
+  }
+  if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
+    throw new Error("Plan is empty");
+  }
+
+  const isRepo = await isGitRepo(workspacePath);
+  if (!isRepo) {
+    throw new Error("Not a git repository (no .git found)");
+  }
+
+  const runId = String(Date.now());
+  const startTime = new Date().toISOString();
+  const runDir = await ensureRunDir(runId);
+  const outputPath = path.join(runDir, "output.log");
+  const outputStream = fs.createWriteStream(outputPath, { flags: "a" });
+  const totalSteps = plan.steps.length;
+
+  activePlan = {
+    runId,
+    workspacePath,
+    runDir,
+    outputStream,
+    sender,
+    cancelled: false
+  };
+
+  const runMeta: Record<string, unknown> = {
+    run_id: runId,
+    workspacePath,
+    startTime,
+    requirement: requirement ? requirement.trim() : "",
+    plan: {
+      name: plan.plan_name,
+      stepsCount: totalSteps
+    },
+    steps: []
+  };
+
+  let lastExitCode = 0;
+  let blockedByPolicy = false;
+  let timedOut = false;
+  let cancelled = false;
+  let cancelledByDecision = false;
+  let decisionPending = false;
+  let lastExecutorEvaluation: Record<string, unknown> | null = null;
+  let lastPrecheckHit = false;
+
+  for (let index = 0; index < plan.steps.length; index += 1) {
+    if (activePlan.cancelled) {
+      cancelled = true;
+      lastExitCode = -1;
+      break;
+    }
+
+    const step = plan.steps[index];
+    sender.send("run:step", { runId, stepIndex: index + 1, total: totalSteps });
+
+    const stepMeta: Record<string, unknown> = {
+      step_index: index + 1,
+      type: step.type,
+      started_at: new Date().toISOString()
+    };
+
+    if (step.type === "note") {
+      appendSystemLog(sender, runId, outputStream, `Note: ${step.message}\n`);
+      stepMeta.ended_at = new Date().toISOString();
+      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      await writeRunMeta(runDir, runMeta);
+      lastPrecheckHit = false;
+      continue;
+    }
+
+    if (step.type === "executor") {
+      const tool = step.tool;
+      stepMeta.tool = tool;
+      stepMeta.instructions_length = step.instructions.length;
+
+      if (!isExecutorToolAllowed(tool)) {
+        appendSystemLog(sender, runId, outputStream, "Executor tool not allowed by policy\n");
+        stepMeta.blocked_by_policy = true;
+        stepMeta.exit_code = -1;
+        blockedByPolicy = true;
+        lastExitCode = -1;
+        const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
+        stepMeta.evidence = evidence;
+        runMeta.evidence = evidence;
+        stepMeta.ended_at = new Date().toISOString();
+        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+        await writeRunMeta(runDir, runMeta);
+        const decisionResult = await maybeRequestDecision(
+          evidence,
+          runId,
+          runDir,
+          sender,
+          outputStream,
+          options
+        );
+        if (decisionResult === "pending") {
+          decisionPending = true;
+          runMeta.decision_pending = true;
+        } else if (decisionResult) {
+          await mergeDecisionFromDisk(runDir, runMeta);
+        }
+        break;
+      }
+
+      const baselineResult = await runCommandCapture(
+        "git",
+        ["diff", "--name-only"],
+        workspacePath
+      );
+      const baselineFiles =
+        baselineResult.code === 0 && baselineResult.stdout
+          ? parseNameOnly(baselineResult.stdout)
+          : [];
+
+      let result = await runExecutorStreaming(
+        tool,
+        step.instructions,
+        workspacePath,
+        runId,
+        sender,
+        outputStream
+      );
+      stepMeta.exit_code = result.exitCode;
+      stepMeta.cancelled = result.cancelled;
+      stepMeta.timeout = result.timedOut;
+      if (result.error) {
+        stepMeta.error = result.error;
+      }
+
+      const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
+      let currentFiles: string[] = [];
+      if (!("error" in evidence) && typeof evidence.git_diff_name_only === "string") {
+        currentFiles = parseNameOnly(evidence.git_diff_name_only);
+      }
+      const changedFiles = diffFromBaseline(baselineFiles, currentFiles);
+      const hasChanges = changedFiles.length > 0;
+      const evaluation: Record<string, unknown> = {
+        baseline_files: baselineFiles,
+        current_files: currentFiles,
+        changed_files: changedFiles,
+        has_changes: hasChanges,
+        retried: false
+      };
+      if (result.exitCode === 0 && !hasChanges) {
+        evaluation.suspicious_no_change = true;
+      }
+      if (result.exitCode === 0 && lastPrecheckHit && !hasChanges) {
+        evaluation.no_op = true;
+      }
+      if (evaluation.no_op) {
+        appendSystemLog(
+          sender,
+          runId,
+          outputStream,
+          "[auto] no-op detected from precheck; skipping modification retry\n"
+        );
+        const grepResult = await runCommandCapture(
+          "git",
+          ["grep", "-n", "Clear Logs", "--", "src/renderer/App.tsx"],
+          workspacePath
+        );
+        if (grepResult.stdout) {
+          appendSystemLog(sender, runId, outputStream, grepResult.stdout);
+        }
+        if (grepResult.stderr) {
+          appendSystemLog(sender, runId, outputStream, grepResult.stderr);
+        }
+      } else if (evaluation.suspicious_no_change) {
+        evaluation.retried = true;
+        const retryInstructions = buildRetryInstructions();
+        const retryResult = await runExecutorStreaming(
+          tool,
+          retryInstructions,
+          workspacePath,
+          runId,
+          sender,
+          outputStream
+        );
+        let retryCurrent: string[] = [];
+        const retryDiff = await runCommandCapture(
+          "git",
+          ["diff", "--name-only"],
+          workspacePath
+        );
+        if (retryDiff.code === 0 && retryDiff.stdout) {
+          retryCurrent = parseNameOnly(retryDiff.stdout);
+        }
+        const retryChanged = diffFromBaseline(baselineFiles, retryCurrent);
+        const retryHasChanges = retryChanged.length > 0;
+        evaluation.retry_result = {
+          exit_code: retryResult.exitCode,
+          baseline_files: baselineFiles,
+          current_files: retryCurrent,
+          changed_files: retryChanged,
+          has_changes: retryHasChanges
+        };
+        if (!retryHasChanges) {
+          appendSystemLog(
+            sender,
+            runId,
+            outputStream,
+            "[auto] retry produced no changes; user attention may be required\n"
+          );
+        }
+
+        result = retryResult;
+        stepMeta.exit_code = retryResult.exitCode;
+        stepMeta.cancelled = retryResult.cancelled;
+        stepMeta.timeout = retryResult.timedOut;
+        if (retryResult.error) {
+          stepMeta.error = retryResult.error;
+        }
+      }
+
+      if (result.cancelled) {
+        cancelled = true;
+        lastExitCode = result.exitCode;
+      } else if (result.timedOut) {
+        timedOut = true;
+        lastExitCode = result.exitCode;
+      } else {
+        lastExitCode = result.exitCode;
+      }
+      stepMeta.evaluation = evaluation;
+      lastExecutorEvaluation = evaluation;
+      appendSystemLog(
+        sender,
+        runId,
+        outputStream,
+        `[evaluation] changed_files=${changedFiles.join(", ") || "(none)"} suspicious_no_change=${Boolean(
+          evaluation.suspicious_no_change
+        )} no_op=${Boolean(evaluation.no_op)}\n`
+      );
+      const finalEvidence =
+        evaluation.retried === true
+          ? await collectGitEvidence(workspacePath, sender, runId, outputStream)
+          : evidence;
+      stepMeta.evidence = finalEvidence;
+      runMeta.evidence = finalEvidence;
+      stepMeta.ended_at = new Date().toISOString();
+      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      await writeRunMeta(runDir, runMeta);
+      lastPrecheckHit = false;
+
+      if (result.cancelled || result.timedOut || result.exitCode !== 0) {
+        break;
+      }
+
+      const decisionResult = await maybeRequestDecision(
+        finalEvidence,
+        runId,
+        runDir,
+        sender,
+        outputStream,
+        options
+      );
+      if (decisionResult === "pending") {
+        decisionPending = true;
+        runMeta.decision_pending = true;
+        break;
+      }
+      if (decisionResult) {
+        await mergeDecisionFromDisk(runDir, runMeta);
+        if (decisionResult === "rejected") {
+          cancelledByDecision = true;
+          break;
+        }
+        if (activePlan.cancelled) {
+          cancelled = true;
+          lastExitCode = -1;
+          break;
+        }
+      }
+      continue;
+    }
+
+    const command = step.command;
+    stepMeta.command = command;
+
+    if (!isCommandAllowed(command)) {
+      appendSystemLog(sender, runId, outputStream, "Command not allowed by policy\n");
+      stepMeta.blocked_by_policy = true;
+      stepMeta.exit_code = -1;
+      blockedByPolicy = true;
+      lastExitCode = -1;
+      const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
+      stepMeta.evidence = evidence;
+      runMeta.evidence = evidence;
+      stepMeta.ended_at = new Date().toISOString();
+      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      await writeRunMeta(runDir, runMeta);
+      const decisionResult = await maybeRequestDecision(
+        evidence,
+        runId,
+        runDir,
+        sender,
+        outputStream,
+        options
+      );
+      if (decisionResult === "pending") {
+        decisionPending = true;
+        runMeta.decision_pending = true;
+      } else if (decisionResult) {
+        await mergeDecisionFromDisk(runDir, runMeta);
+      }
+      break;
+    }
+
+    const parts = command.split(" ").filter(Boolean);
+    const [bin, ...args] = parts;
+    const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
+    const stdout = result.stdout.trim();
+    const isPrecheck =
+      command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
+    lastPrecheckHit = isPrecheck && Boolean(stdout);
+    stepMeta.exit_code = result.exitCode;
+    stepMeta.cancelled = result.cancelled;
+    stepMeta.timeout = result.timedOut;
+
+    if (result.cancelled) {
+      cancelled = true;
+      lastExitCode = result.exitCode;
+    } else if (result.timedOut) {
+      timedOut = true;
+      lastExitCode = result.exitCode;
+    } else {
+      lastExitCode = result.exitCode;
+    }
+
+    const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
+    stepMeta.evidence = evidence;
+    runMeta.evidence = evidence;
+    stepMeta.ended_at = new Date().toISOString();
+    (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+    await writeRunMeta(runDir, runMeta);
+
+    if (result.cancelled || result.timedOut || result.exitCode !== 0) {
+      break;
+    }
+
+    const decisionResult = await maybeRequestDecision(
+      evidence,
+      runId,
+      runDir,
+      sender,
+      outputStream,
+      options
+    );
+    if (decisionResult === "pending") {
+      decisionPending = true;
+      runMeta.decision_pending = true;
+      break;
+    }
+    if (decisionResult) {
+      await mergeDecisionFromDisk(runDir, runMeta);
+      if (decisionResult === "rejected") {
+        cancelledByDecision = true;
+        break;
+      }
+      if (activePlan.cancelled) {
+        cancelled = true;
+        lastExitCode = -1;
+        break;
+      }
+    }
+  }
+
+  const endTime = new Date().toISOString();
+  await mergeDecisionFromDisk(runDir, runMeta);
+  runMeta.endTime = endTime;
+  runMeta.exitCode = lastExitCode;
+  if (blockedByPolicy) runMeta.blocked_by_policy = true;
+  if (timedOut) runMeta.timeout = true;
+  if (cancelled) runMeta.cancelled = true;
+  if (cancelledByDecision) runMeta.cancelled_by_decision = true;
+  if (decisionPending) runMeta.decision_pending = true;
+
+  await writeRunMeta(runDir, runMeta);
+  outputStream.end();
+  sender.send("run:done", { runId, exitCode: lastExitCode });
+
+  activePlan = null;
+  return {
+    runId,
+    exitCode: lastExitCode,
+    cancelled,
+    cancelledByDecision,
+    blockedByPolicy,
+    timedOut,
+    decisionPending,
+    lastExecutorEvaluation
+  };
+};
+
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -801,351 +1228,170 @@ const registerIpc = () => {
   ipcMain.handle(
     "run:plan",
     async (event, payload: { workspacePath: string; plan: TaskPlan; requirement?: string }) => {
+      const result = await runPlanInternal(event.sender, payload, { awaitDecision: true });
+      return result.runId;
+    });
+
+  ipcMain.handle(
+    "autobuild:start",
+    async (event, payload: { workspace: string; requirement: string; maxIterations?: number }) => {
+      if (autobuildActive || activePlan) {
+        throw new Error("Another run is already active");
+      }
+      if (!payload.workspace) {
+        throw new Error("Workspace not set");
+      }
+      if (!payload.requirement || !payload.requirement.trim()) {
+        throw new Error("Requirement is empty");
+      }
+
+      autobuildActive = true;
+      autobuildCancelled = false;
+      const maxIterations = payload.maxIterations ?? 2;
+      let iterationsRun = 0;
+      let stopReason = "max_iterations_reached";
+
+      try {
+        for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
+          if (autobuildCancelled) {
+            stopReason = "cancelled";
+            break;
+          }
+
+          event.sender.send("autobuild:status", {
+            iteration,
+            phase: "planning",
+            message: "Generating plan"
+          });
+
+          let plan: TaskPlan;
+          try {
+            plan = await generatePlanFromRequirement(payload.requirement);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: `Planning failed: ${message}`
+            });
+            stopReason = "planning_failed";
+            break;
+          }
+
+          event.sender.send("autobuild:plan", { iteration, plan });
+
+          if (autobuildCancelled) {
+            stopReason = "cancelled";
+            break;
+          }
+
+          event.sender.send("autobuild:status", {
+            iteration,
+            phase: "running",
+            message: "Running plan"
+          });
+
+          const result = await runPlanInternal(
+            event.sender,
+            { workspacePath: payload.workspace, plan, requirement: payload.requirement },
+            { awaitDecision: false }
+          );
+          iterationsRun += 1;
+
+          if (result.decisionPending) {
+            stopReason = "decision_pending";
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: "Decision pending, awaiting user input"
+            });
+            break;
+          }
+
+          if (result.cancelled) {
+            stopReason = "cancelled";
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: "Cancelled"
+            });
+            break;
+          }
+
+          const evaluation = result.lastExecutorEvaluation;
+          const noOp = evaluation?.no_op === true;
+          const suspiciousNoChange = evaluation?.suspicious_no_change === true;
+          const retried = evaluation?.retried === true;
+          const retryHasChanges = evaluation?.retry_result
+            ? (evaluation.retry_result as Record<string, unknown>).has_changes === true
+            : false;
+
+          if (noOp) {
+            stopReason = "no_op";
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: "No-op detected; please validate behavior"
+            });
+            break;
+          }
+
+          if (suspiciousNoChange && retried && !retryHasChanges) {
+            stopReason = "retry_no_change";
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: "Retry produced no changes; need more specific instructions"
+            });
+            break;
+          }
+
+          if (result.exitCode !== 0) {
+            if (iteration < maxIterations) {
+              continue;
+            }
+            stopReason = "failed";
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: "Run failed"
+            });
+            break;
+          }
+
+          if (iteration >= maxIterations) {
+            stopReason = "max_iterations_reached";
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: "Max iterations reached"
+            });
+            break;
+          }
+        }
+      } finally {
+        autobuildActive = false;
+        autobuildCancelled = false;
+      }
+
+      event.sender.send("autobuild:done", {
+        stop_reason: stopReason,
+        iterations_run: iterationsRun
+      });
+      return true;
+    }
+  );
+
+  ipcMain.handle("autobuild:cancel", async () => {
+    autobuildCancelled = true;
     if (activePlan) {
-      throw new Error("Another run is already active");
-    }
-
-    const { workspacePath, plan, requirement } = payload;
-    if (!workspacePath) {
-      throw new Error("Workspace not set");
-    }
-    if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
-      throw new Error("Plan is empty");
-    }
-
-    const isRepo = await isGitRepo(workspacePath);
-    if (!isRepo) {
-      throw new Error("Not a git repository (no .git found)");
-    }
-
-    const runId = String(Date.now());
-    const startTime = new Date().toISOString();
-    const runDir = await ensureRunDir(runId);
-    const outputPath = path.join(runDir, "output.log");
-    const outputStream = fs.createWriteStream(outputPath, { flags: "a" });
-    const totalSteps = plan.steps.length;
-
-    activePlan = {
-      runId,
-      workspacePath,
-      runDir,
-      outputStream,
-      sender: event.sender,
-      cancelled: false
-    };
-
-    const runMeta: Record<string, unknown> = {
-      run_id: runId,
-      workspacePath,
-      startTime,
-      requirement: requirement ? requirement.trim() : "",
-      plan: {
-        name: plan.plan_name,
-        stepsCount: totalSteps
-      },
-      steps: []
-    };
-
-    let lastExitCode = 0;
-    let blockedByPolicy = false;
-    let timedOut = false;
-    let cancelled = false;
-    let cancelledByDecision = false;
-    let lastPrecheckHit = false;
-
-    for (let index = 0; index < plan.steps.length; index += 1) {
-      if (activePlan.cancelled) {
-        cancelled = true;
-        lastExitCode = -1;
-        break;
-      }
-
-      const step = plan.steps[index];
-      event.sender.send("run:step", { runId, stepIndex: index + 1, total: totalSteps });
-
-      const stepMeta: Record<string, unknown> = {
-        step_index: index + 1,
-        type: step.type,
-        started_at: new Date().toISOString()
-      };
-
-      if (step.type === "note") {
-        appendSystemLog(event.sender, runId, outputStream, `Note: ${step.message}\n`);
-        stepMeta.ended_at = new Date().toISOString();
-        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
-        await writeRunMeta(runDir, runMeta);
-        lastPrecheckHit = false;
-        continue;
-      }
-
-      if (step.type === "executor") {
-        const tool = step.tool;
-        stepMeta.tool = tool;
-        stepMeta.instructions_length = step.instructions.length;
-
-        if (!isExecutorToolAllowed(tool)) {
-          appendSystemLog(event.sender, runId, outputStream, "Executor tool not allowed by policy\n");
-          stepMeta.blocked_by_policy = true;
-          stepMeta.exit_code = -1;
-          blockedByPolicy = true;
-          lastExitCode = -1;
-          const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-          stepMeta.evidence = evidence;
-          runMeta.evidence = evidence;
-          stepMeta.ended_at = new Date().toISOString();
-          (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
-          await writeRunMeta(runDir, runMeta);
-          const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
-          if (decisionResult) {
-            await mergeDecisionFromDisk(runDir, runMeta);
-          }
-          break;
-        }
-
-        const baselineResult = await runCommandCapture(
-          "git",
-          ["diff", "--name-only"],
-          workspacePath
-        );
-        const baselineFiles =
-          baselineResult.code === 0 && baselineResult.stdout
-            ? parseNameOnly(baselineResult.stdout)
-            : [];
-
-        let result = await runExecutorStreaming(
-          tool,
-          step.instructions,
-          workspacePath,
-          runId,
-          event.sender,
-          outputStream
-        );
-        stepMeta.exit_code = result.exitCode;
-        stepMeta.cancelled = result.cancelled;
-        stepMeta.timeout = result.timedOut;
-        if (result.error) {
-          stepMeta.error = result.error;
-        }
-
-        const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-        let currentFiles: string[] = [];
-        if (!("error" in evidence) && typeof evidence.git_diff_name_only === "string") {
-          currentFiles = parseNameOnly(evidence.git_diff_name_only);
-        }
-        const changedFiles = diffFromBaseline(baselineFiles, currentFiles);
-        const hasChanges = changedFiles.length > 0;
-        const evaluation: Record<string, unknown> = {
-          baseline_files: baselineFiles,
-          current_files: currentFiles,
-          changed_files: changedFiles,
-          has_changes: hasChanges,
-          retried: false
-        };
-        if (result.exitCode === 0 && !hasChanges) {
-          evaluation.suspicious_no_change = true;
-        }
-        if (result.exitCode === 0 && lastPrecheckHit && !hasChanges) {
-          evaluation.no_op = true;
-        }
-        if (evaluation.no_op) {
-          appendSystemLog(
-            event.sender,
-            runId,
-            outputStream,
-            "[auto] no-op detected from precheck; skipping modification retry\n"
-          );
-          const grepResult = await runCommandCapture(
-            "git",
-            ["grep", "-n", "Clear Logs", "--", "src/renderer/App.tsx"],
-            workspacePath
-          );
-          if (grepResult.stdout) {
-            appendSystemLog(event.sender, runId, outputStream, grepResult.stdout);
-          }
-          if (grepResult.stderr) {
-            appendSystemLog(event.sender, runId, outputStream, grepResult.stderr);
-          }
-        } else if (evaluation.suspicious_no_change) {
-          evaluation.retried = true;
-          const retryInstructions = buildRetryInstructions();
-          const retryResult = await runExecutorStreaming(
-            tool,
-            retryInstructions,
-            workspacePath,
-            runId,
-            event.sender,
-            outputStream
-          );
-          let retryChanged: string[] = [];
-          const retryDiff = await runCommandCapture(
-            "git",
-            ["diff", "--name-only"],
-            workspacePath
-          );
-          let retryCurrent: string[] = [];
-          if (retryDiff.code === 0 && retryDiff.stdout) {
-            retryCurrent = parseNameOnly(retryDiff.stdout);
-          }
-          retryChanged = diffFromBaseline(baselineFiles, retryCurrent);
-          const retryHasChanges = retryChanged.length > 0;
-          evaluation.retry_result = {
-            exit_code: retryResult.exitCode,
-            baseline_files: baselineFiles,
-            current_files: retryCurrent,
-            changed_files: retryChanged,
-            has_changes: retryHasChanges
-          };
-          if (!retryHasChanges) {
-            appendSystemLog(
-              event.sender,
-              runId,
-              outputStream,
-              "[auto] retry produced no changes; user attention may be required\n"
-            );
-          }
-
-          result = retryResult;
-          stepMeta.exit_code = retryResult.exitCode;
-          stepMeta.cancelled = retryResult.cancelled;
-          stepMeta.timeout = retryResult.timedOut;
-          if (retryResult.error) {
-            stepMeta.error = retryResult.error;
-          }
-        }
-
-        if (result.cancelled) {
-          cancelled = true;
-          lastExitCode = result.exitCode;
-        } else if (result.timedOut) {
-          timedOut = true;
-          lastExitCode = result.exitCode;
-        } else {
-          lastExitCode = result.exitCode;
-        }
-        stepMeta.evaluation = evaluation;
-        appendSystemLog(
-          event.sender,
-          runId,
-          outputStream,
-          `[evaluation] changed_files=${changedFiles.join(", ") || "(none)"} suspicious_no_change=${Boolean(
-            evaluation.suspicious_no_change
-          )} no_op=${Boolean(evaluation.no_op)}\n`
-        );
-        const finalEvidence =
-          evaluation.retried === true
-            ? await collectGitEvidence(workspacePath, event.sender, runId, outputStream)
-            : evidence;
-        stepMeta.evidence = finalEvidence;
-        runMeta.evidence = finalEvidence;
-        stepMeta.ended_at = new Date().toISOString();
-        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
-        await writeRunMeta(runDir, runMeta);
-        lastPrecheckHit = false;
-
-        if (result.cancelled || result.timedOut || result.exitCode !== 0) {
-          break;
-        }
-
-        const decisionResult = await maybeRequestDecision(finalEvidence, runId, runDir, event.sender, outputStream);
-        if (decisionResult) {
-          await mergeDecisionFromDisk(runDir, runMeta);
-          if (decisionResult === "rejected") {
-            cancelledByDecision = true;
-            break;
-          }
-          if (activePlan.cancelled) {
-            cancelled = true;
-            lastExitCode = -1;
-            break;
-          }
-        }
-        continue;
-      }
-
-      const command = step.command;
-      stepMeta.command = command;
-
-      if (!isCommandAllowed(command)) {
-        appendSystemLog(event.sender, runId, outputStream, "Command not allowed by policy\n");
-        stepMeta.blocked_by_policy = true;
-        stepMeta.exit_code = -1;
-        blockedByPolicy = true;
-        lastExitCode = -1;
-        const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-        stepMeta.evidence = evidence;
-        runMeta.evidence = evidence;
-        stepMeta.ended_at = new Date().toISOString();
-        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
-        await writeRunMeta(runDir, runMeta);
-        const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
-        if (decisionResult) {
-          await mergeDecisionFromDisk(runDir, runMeta);
-        }
-        break;
-      }
-
-      const parts = command.split(" ").filter(Boolean);
-      const [bin, ...args] = parts;
-      const result = await runCommandStreaming(bin, args, workspacePath, runId, event.sender, outputStream);
-      const stdout = result.stdout.trim();
-      const isPrecheck =
-        command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
-      lastPrecheckHit = isPrecheck && Boolean(stdout);
-      stepMeta.exit_code = result.exitCode;
-      stepMeta.cancelled = result.cancelled;
-      stepMeta.timeout = result.timedOut;
-
-      if (result.cancelled) {
-        cancelled = true;
-        lastExitCode = result.exitCode;
-      } else if (result.timedOut) {
-        timedOut = true;
-        lastExitCode = result.exitCode;
-      } else {
-        lastExitCode = result.exitCode;
-      }
-
-      const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-      stepMeta.evidence = evidence;
-      runMeta.evidence = evidence;
-      stepMeta.ended_at = new Date().toISOString();
-      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
-      await writeRunMeta(runDir, runMeta);
-
-      if (result.cancelled || result.timedOut || result.exitCode !== 0) {
-        break;
-      }
-
-      const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
-      if (decisionResult) {
-        await mergeDecisionFromDisk(runDir, runMeta);
-        if (decisionResult === "rejected") {
-          cancelledByDecision = true;
-          break;
-        }
-        if (activePlan.cancelled) {
-          cancelled = true;
-          lastExitCode = -1;
-          break;
-        }
+      activePlan.cancelled = true;
+      if (activeRun && activeRun.runId === activePlan.runId) {
+        activeRun.cancelled = true;
+        terminateProcess(activeRun.child, activeRun.killGroup);
       }
     }
-
-    const endTime = new Date().toISOString();
-    await mergeDecisionFromDisk(runDir, runMeta);
-    runMeta.endTime = endTime;
-    runMeta.exitCode = lastExitCode;
-    if (blockedByPolicy) runMeta.blocked_by_policy = true;
-    if (timedOut) runMeta.timeout = true;
-    if (cancelled) runMeta.cancelled = true;
-    if (cancelledByDecision) runMeta.cancelled_by_decision = true;
-
-    await writeRunMeta(runDir, runMeta);
-    outputStream.end();
-    event.sender.send("run:done", { runId, exitCode: lastExitCode });
-
-    activePlan = null;
-    return runId;
+    return true;
   });
 
   ipcMain.handle("run:cancel", async (event, runId: string) => {

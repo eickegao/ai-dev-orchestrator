@@ -14,6 +14,9 @@ contextBridge.exposeInMainWorld("api", {
     requirement?: string;
   }) =>
     ipcRenderer.invoke("run:plan", payload),
+  startAutobuild: async (payload: { workspace: string; requirement: string; maxIterations?: number }) =>
+    ipcRenderer.invoke("autobuild:start", payload),
+  cancelAutobuild: async () => ipcRenderer.invoke("autobuild:cancel"),
   generatePlan: async (requirement: string) => ipcRenderer.invoke("planner:generatePlan", requirement),
   cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),
   submitDecision: async (payload: { runId: string; result: "approved" | "rejected" }) =>
@@ -53,5 +56,36 @@ contextBridge.exposeInMainWorld("api", {
     };
     ipcRenderer.on("run:decision", listener);
     return () => ipcRenderer.removeListener("run:decision", listener);
+  },
+  onAutobuildStatus: (
+    callback: (payload: { iteration: number; phase: "planning" | "running" | "done"; message: string }) => void
+  ) => {
+    const listener = (
+      _event: unknown,
+      payload: { iteration: number; phase: "planning" | "running" | "done"; message: string }
+    ) => {
+      callback(payload);
+    };
+    ipcRenderer.on("autobuild:status", listener);
+    return () => ipcRenderer.removeListener("autobuild:status", listener);
+  },
+  onAutobuildPlan: (callback: (payload: { iteration: number; plan: TaskPlan }) => void) => {
+    const listener = (_event: unknown, payload: { iteration: number; plan: TaskPlan }) => {
+      callback(payload);
+    };
+    ipcRenderer.on("autobuild:plan", listener);
+    return () => ipcRenderer.removeListener("autobuild:plan", listener);
+  },
+  onAutobuildDone: (
+    callback: (payload: { stop_reason: string; iterations_run: number }) => void
+  ) => {
+    const listener = (
+      _event: unknown,
+      payload: { stop_reason: string; iterations_run: number }
+    ) => {
+      callback(payload);
+    };
+    ipcRenderer.on("autobuild:done", listener);
+    return () => ipcRenderer.removeListener("autobuild:done", listener);
   }
 });
