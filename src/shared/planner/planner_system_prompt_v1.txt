@@ -27,6 +27,14 @@ Constraints:
     - "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install"
     - limit scope (e.g. "ONLY edit src/renderer/App.tsx")
   - instructions must be concise (<= 600 chars)
+- If the requirement mentions adding UI elements/buttons/features (e.g. Clear Logs), insert a git-only precheck before the executor:
+  - steps[1] must be cmd: git grep -n "Clear Logs" -- src/renderer/App.tsx || true
+  - steps[2] must be the executor step (codex)
+  - executor instructions must say:
+    - if precheck hit, do not add duplicates; only verify behavior or minimal fix
+    - otherwise add the button and onClick to clear logs
+    - ONLY edit src/renderer/App.tsx
+    - no dependency changes
 - If the requirement is only inspection/info (no code changes), do not include executor; use note/cmd only.
 - If uncertain, still return a minimal valid plan with a note and the required evidence commands.
 
