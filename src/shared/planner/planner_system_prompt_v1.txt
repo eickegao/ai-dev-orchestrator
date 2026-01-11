@@ -35,6 +35,8 @@ Constraints:
     - otherwise add the button and onClick to clear logs
     - ONLY edit src/renderer/App.tsx
     - no dependency changes
+- When an executor step is present, include a note step after the executor and before evidence cmds with concrete acceptance criteria:
+  - at least 3 observable items (e.g. button renders, click clears logs, new logs still append, no dependency changes)
 - If the requirement is only inspection/info (no code changes), do not include executor; use note/cmd only.
 - If uncertain, still return a minimal valid plan with a note and the required evidence commands.
 
