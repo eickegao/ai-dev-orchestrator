@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "main": "dist/main/main.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "dev": "concurrently -k \"tsc -p tsconfig.json --watch --preserveWatchOutput\" \"vite\" \"wait-on dist/main/main.js dist/main/preload.js tcp:5173 && electron .\"",
     "build": "tsc -p tsconfig.json && vite build",

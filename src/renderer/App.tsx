@@ -36,6 +36,7 @@ const App = () => {
   const [stepProgress, setStepProgress] = useState<{ current: number; total: number } | null>(null);
   const [planInput, setPlanInput] = useState(() => JSON.stringify(defaultPlan, null, 2));
   const [planError, setPlanError] = useState<string | null>(null);
+  const [apiError, setApiError] = useState<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -43,6 +44,10 @@ const App = () => {
   };
 
   const selectWorkspace = async () => {
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
     const selected = await window.api.selectWorkspace();
     if (selected) {
       setWorkspacePath(selected);
@@ -98,6 +103,11 @@ const App = () => {
       return;
     }
 
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
+
     let plan: TaskPlan;
     try {
       plan = parsePlan(planInput);
@@ -138,6 +148,10 @@ const App = () => {
 
   const cancelRun = async () => {
     if (!currentRunId) return;
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
     const cancelled = await window.api.cancelRun(currentRunId);
     if (!cancelled) {
       appendLog({
@@ -150,6 +164,10 @@ const App = () => {
 
   const resolveDecision = async (result: "approved" | "rejected") => {
     if (!decision) return;
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
     const success = await window.api.submitDecision({ runId: decision.runId, result });
     if (success) {
       appendLog({
@@ -171,6 +189,11 @@ const App = () => {
     const storedPlan = window.localStorage.getItem("planEditor");
     if (storedPlan) {
       setPlanInput(storedPlan);
+    }
+
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
     }
 
     let isMounted = true;
@@ -252,6 +275,7 @@ const App = () => {
           <p className="muted">
             Step: {stepProgress ? `${stepProgress.current}/${stepProgress.total}` : "(idle)"}
           </p>
+          {apiError && <p className="error">{apiError}</p>}
         </div>
         <div className="actions">
           <button className="secondary" onClick={selectWorkspace}>

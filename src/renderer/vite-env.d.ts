@@ -6,7 +6,7 @@ declare global {
       version: string;
       platform: string;
     };
-    api: {
+    api?: {
       selectWorkspace: () => Promise<string | null>;
       runPlan: (payload: {
         workspacePath: string;

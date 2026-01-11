@@ -5,18 +5,19 @@ import fs from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 const createWindow = () => {
+  const preloadPath = path.join(__dirname, "preload.js");
   const window = new BrowserWindow({
     width: 1200,
     height: 800,
     webPreferences: {
-      preload: path.join(app.getAppPath(), "dist/main/preload.js"),
+      preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false
     }
   });
 
   if (app.isPackaged) {
-    const indexPath = path.join(app.getAppPath(), "dist/renderer/index.html");
+    const indexPath = path.join(__dirname, "../renderer/index.html");
     window.loadURL(pathToFileURL(indexPath).toString());
   } else {
     window.loadURL("http://localhost:5173");
