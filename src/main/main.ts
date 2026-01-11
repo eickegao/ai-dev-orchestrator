@@ -188,6 +188,8 @@ const formatZodError = (error: ZodError) =>
     })
     .join("; ");
 
+const previewText = (value: string, limit = 200) => value.slice(0, limit);
+
 const extractJsonFromText = (rawText: string) => {
   const trimmed = rawText.trim();
   if (!trimmed) {
@@ -296,17 +298,20 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
     throw new Error("OpenAI response missing content");
   }
 
-  const preview = rawText.slice(0, 200);
+  const rawPreview = previewText(rawText);
   console.log(`[planner] raw output length: ${rawText.length}`);
-  console.log(`[planner] raw output preview: ${preview}`);
+  console.log(`[planner] raw output preview: ${rawPreview}`);
 
   let parsedJson: unknown;
+  let extractedJsonText = "";
   try {
-    const jsonText = extractJsonFromText(rawText);
-    parsedJson = JSON.parse(jsonText);
+    extractedJsonText = extractJsonFromText(rawText);
+    parsedJson = JSON.parse(extractedJsonText);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Planner JSON parse error: ${message}; preview="${preview}"`);
+    throw new Error(
+      `Planner JSON parse error: ${message}; rawPreview="${rawPreview}"`
+    );
   }
 
   try {
@@ -314,8 +319,14 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
     validateGeneratedPlan(plan);
     return plan;
   } catch (error) {
+    const extractedPreview = previewText(extractedJsonText);
+    const parsedPreview = previewText(
+      JSON.stringify(parsedJson ?? null)
+    );
     if (error instanceof ZodError) {
-      throw new Error(`Plan schema validation failed: ${formatZodError(error)}`);
+      throw new Error(
+        `Plan schema validation failed: ${formatZodError(error)}; rawPreview="${rawPreview}"; extractedPreview="${extractedPreview}"; parsedPreview="${parsedPreview}"`
+      );
     }
     throw error;
   }

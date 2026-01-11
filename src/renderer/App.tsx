@@ -333,7 +333,15 @@ const App = () => {
           onChange={(event) => setPlanInput(event.target.value)}
         />
         {planError && <p className="error">{planError}</p>}
-        {generateError && <p className="error">{generateError}</p>}
+        {generateError && (
+          <p className="error">
+            {generateError.startsWith("Planner JSON parse error")
+              ? `Parse Error: ${generateError}`
+              : generateError.startsWith("Plan schema validation failed")
+                ? `Schema Error: ${generateError}`
+                : generateError}
+          </p>
+        )}
         {isGenerating && <p className="muted">Generating plan...</p>}
         <div className="actions">
           <button className="primary" onClick={generatePlan} disabled={isGenerating}>
