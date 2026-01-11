@@ -8,6 +8,11 @@ export const PlanStepSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("note"),
     message: z.string()
+  }),
+  z.object({
+    type: z.literal("executor"),
+    tool: z.enum(["codex", "claude_code"]),
+    instructions: z.string()
   })
 ]);
 

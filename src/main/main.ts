@@ -29,6 +29,7 @@ const createWindow = () => {
 
 const RUN_TIMEOUT_MS = 30_000;
 const ALLOWED_COMMAND_PREFIXES = ["git"];
+const ALLOWED_EXECUTOR_TOOLS = new Set(["codex"]);
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_MODEL = "gpt-4o-mini";
 const DEPENDENCY_FILES = new Set([
@@ -58,6 +59,8 @@ const isGitRepo = async (workspacePath: string) => {
 
 const isCommandAllowed = (command: string) =>
   ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
+
+const isExecutorToolAllowed = (tool: string) => ALLOWED_EXECUTOR_TOOLS.has(tool);
 
 const PROMPT_RELATIVE_PATH = path.join("shared", "planner", "planner_system_prompt_v1.txt");
 const DIST_RELATIVE_PATH = path.join("dist", PROMPT_RELATIVE_PATH);
@@ -107,6 +110,7 @@ type ActiveRun = {
   timeoutId: NodeJS.Timeout;
   cancelled: boolean;
   timedOut: boolean;
+  killGroup: boolean;
 };
 
 type ActivePlan = {
@@ -152,11 +156,27 @@ const appendSystemLog = (sender: WebContents, runId: string, outputStream: fs.Wr
   sender.send("run:output", { runId, source: "system", text });
 };
 
-const terminateProcess = (child: ChildProcessWithoutNullStreams) => {
-  child.kill("SIGTERM");
+const terminateProcess = (child: ChildProcessWithoutNullStreams, killGroup = false) => {
+  if (killGroup && child.pid && process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      child.kill("SIGTERM");
+    }
+  } else {
+    child.kill("SIGTERM");
+  }
   const killTimer = setTimeout(() => {
     if (!child.killed) {
-      child.kill("SIGKILL");
+      if (killGroup && child.pid && process.platform !== "win32") {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      } else {
+        child.kill("SIGKILL");
+      }
     }
   }, 3_000);
   child.once("exit", () => clearTimeout(killTimer));
@@ -446,7 +466,7 @@ const runCommandStreaming = (
       if (!activeRun || activeRun.runId !== runId) return;
       activeRun.timedOut = true;
       appendSystemLog(sender, runId, outputStream, "[Timeout exceeded]\n");
-      terminateProcess(child);
+      terminateProcess(child, false);
     }, RUN_TIMEOUT_MS);
 
     activeRun = {
@@ -459,7 +479,8 @@ const runCommandStreaming = (
       child,
       timeoutId,
       cancelled: false,
-      timedOut: false
+      timedOut: false,
+      killGroup: false
     };
 
     const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
@@ -490,6 +511,79 @@ const runCommandStreaming = (
       const timedOut = activeRun?.timedOut ?? false;
       activeRun = null;
       resolve({ exitCode: -1, cancelled, timedOut });
+    });
+  });
+
+const runExecutorStreaming = (
+  tool: string,
+  instructions: string,
+  workspacePath: string,
+  runId: string,
+  sender: WebContents,
+  outputStream: fs.WriteStream
+) =>
+  new Promise<{ exitCode: number; cancelled: boolean; timedOut: boolean; error?: string }>((resolve) => {
+    const child = spawn(tool, [], { cwd: workspacePath, detached: true });
+    const timeoutId = setTimeout(() => {
+      if (!activeRun || activeRun.runId !== runId) return;
+      activeRun.timedOut = true;
+      appendSystemLog(sender, runId, outputStream, "[Timeout exceeded]\n");
+      terminateProcess(child, true);
+    }, RUN_TIMEOUT_MS);
+
+    activeRun = {
+      runId,
+      workspacePath,
+      command: `executor:${tool}`,
+      startTime: new Date().toISOString(),
+      runDir: "",
+      outputStream,
+      child,
+      timeoutId,
+      cancelled: false,
+      timedOut: false,
+      killGroup: true
+    };
+
+    const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
+      const text = chunk.toString();
+      const prefix = source === "stderr" ? "[executor][stderr] " : "[executor] ";
+      outputStream.write(`${prefix}${text}`);
+      sender.send("run:output", { runId, source, text: `${prefix}${text}` });
+    };
+
+    child.stdout.on("data", (chunk) => sendChunk("stdout", chunk));
+    child.stderr.on("data", (chunk) => sendChunk("stderr", chunk));
+
+    if (child.stdin) {
+      try {
+        child.stdin.write(`${instructions.trim()}\n`);
+        child.stdin.end();
+      } catch {
+        // ignore stdin write errors
+      }
+    }
+
+    child.on("close", (code) => {
+      if (activeRun?.runId === runId) {
+        clearTimeout(activeRun.timeoutId);
+      }
+      const cancelled = activeRun?.cancelled ?? false;
+      const timedOut = activeRun?.timedOut ?? false;
+      activeRun = null;
+      resolve({ exitCode: code ?? -1, cancelled, timedOut });
+    });
+
+    child.on("error", (error) => {
+      if (activeRun?.runId === runId) {
+        clearTimeout(activeRun.timeoutId);
+      }
+      const message = error.code === "ENOENT" ? `${tool} not found in PATH` : error.message;
+      appendSystemLog(sender, runId, outputStream, `Executor error: ${message}\n`);
+      const cancelled = activeRun?.cancelled ?? false;
+      const timedOut = activeRun?.timedOut ?? false;
+      activeRun = null;
+      resolve({ exitCode: -1, cancelled, timedOut, error: message });
     });
   });
 
@@ -597,6 +691,82 @@ const registerIpc = () => {
         continue;
       }
 
+      if (step.type === "executor") {
+        const tool = step.tool;
+        stepMeta.tool = tool;
+        stepMeta.instructions_length = step.instructions.length;
+
+        if (!isExecutorToolAllowed(tool)) {
+          appendSystemLog(event.sender, runId, outputStream, "Executor tool not allowed by policy\n");
+          stepMeta.blocked_by_policy = true;
+          stepMeta.exit_code = -1;
+          blockedByPolicy = true;
+          lastExitCode = -1;
+          const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
+          stepMeta.evidence = evidence;
+          runMeta.evidence = evidence;
+          stepMeta.ended_at = new Date().toISOString();
+          (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+          await writeRunMeta(runDir, runMeta);
+          const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
+          if (decisionResult) {
+            await mergeDecisionFromDisk(runDir, runMeta);
+          }
+          break;
+        }
+
+        const result = await runExecutorStreaming(
+          tool,
+          step.instructions,
+          workspacePath,
+          runId,
+          event.sender,
+          outputStream
+        );
+        stepMeta.exit_code = result.exitCode;
+        stepMeta.cancelled = result.cancelled;
+        stepMeta.timeout = result.timedOut;
+        if (result.error) {
+          stepMeta.error = result.error;
+        }
+
+        if (result.cancelled) {
+          cancelled = true;
+          lastExitCode = result.exitCode;
+        } else if (result.timedOut) {
+          timedOut = true;
+          lastExitCode = result.exitCode;
+        } else {
+          lastExitCode = result.exitCode;
+        }
+
+        const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
+        stepMeta.evidence = evidence;
+        runMeta.evidence = evidence;
+        stepMeta.ended_at = new Date().toISOString();
+        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+        await writeRunMeta(runDir, runMeta);
+
+        if (result.cancelled || result.timedOut || result.exitCode !== 0) {
+          break;
+        }
+
+        const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
+        if (decisionResult) {
+          await mergeDecisionFromDisk(runDir, runMeta);
+          if (decisionResult === "rejected") {
+            cancelledByDecision = true;
+            break;
+          }
+          if (activePlan.cancelled) {
+            cancelled = true;
+            lastExitCode = -1;
+            break;
+          }
+        }
+        continue;
+      }
+
       const command = step.command;
       stepMeta.command = command;
 
@@ -687,7 +857,7 @@ const registerIpc = () => {
     appendSystemLog(event.sender, runId, activePlan.outputStream, "[Cancelled by user]\n");
     if (activeRun && activeRun.runId === runId) {
       activeRun.cancelled = true;
-      terminateProcess(activeRun.child);
+      terminateProcess(activeRun.child, activeRun.killGroup);
     }
     const pending = pendingDecisions.get(runId);
     if (pending) {
