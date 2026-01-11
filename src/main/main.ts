@@ -190,6 +190,11 @@ const isCommandAllowed = (command: string) =>
 
 const isExecutorToolAllowed = (tool: string) => ALLOWED_EXECUTOR_TOOLS.has(tool);
 
+const hasForbiddenShellOperators = (command: string) => {
+  const forbidden = ["||", "&&", "|", ">", "<", ";", "$(", "`"];
+  return forbidden.some((op) => command.includes(op));
+};
+
 const PROMPT_RELATIVE_PATH = path.join("shared", "planner", "planner_system_prompt_v1.txt");
 const DIST_RELATIVE_PATH = path.join("dist", PROMPT_RELATIVE_PATH);
 const SRC_RELATIVE_PATH = path.join("src", PROMPT_RELATIVE_PATH);
@@ -780,6 +785,71 @@ const diffFromBaseline = (baseline: string[], current: string[]) => {
   return current.filter((file) => !baselineSet.has(file));
 };
 
+const splitArgs = (command: string) => {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escape = false;
+
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i];
+
+    if (escape) {
+      current += char;
+      escape = false;
+      continue;
+    }
+
+    if (quote === "\"") {
+      if (char === "\\") {
+        escape = true;
+        continue;
+      }
+      if (char === "\"") {
+        quote = null;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+
+    if (char === "\\") {
+      escape = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current) {
+    args.push(current);
+  }
+
+  return args;
+};
+
 type RunPlanResult = {
   runId: string;
   exitCode: number;
@@ -1113,32 +1183,71 @@ const runPlanInternal = async (
       break;
     }
 
-    const parts = command.split(" ").filter(Boolean);
-    const [bin, ...args] = parts;
-      const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
-      const stdout = result.stdout.trim();
-      const isGrep = command.startsWith("git grep");
-      const isGrepNoMatch = isGrep && result.exitCode === 1;
-      const effectiveExitCode = isGrepNoMatch ? 0 : result.exitCode;
-      if (isGrepNoMatch) {
-        appendSystemLog(sender, runId, outputStream, "[precheck] no matches\n");
+    if (hasForbiddenShellOperators(command)) {
+      appendSystemLog(sender, runId, outputStream, "Command contains forbidden shell operators\n");
+      stepMeta.blocked_by_policy = true;
+      stepMeta.exit_code = -1;
+      blockedByPolicy = true;
+      lastExitCode = -1;
+      const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
+      stepMeta.evidence = evidence;
+      runMeta.evidence = evidence;
+      stepMeta.ended_at = new Date().toISOString();
+      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      await writeRunMeta(runDir, runMeta);
+      const decisionResult = await maybeRequestDecision(
+        evidence,
+        runId,
+        runDir,
+        sender,
+        outputStream,
+        options
+      );
+      if (decisionResult === "pending") {
+        decisionPending = true;
+        runMeta.decision_pending = true;
+      } else if (decisionResult) {
+        await mergeDecisionFromDisk(runDir, runMeta);
       }
-      const isPrecheck =
-        command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
-      lastPrecheckHit = isPrecheck && Boolean(stdout);
-      stepMeta.exit_code = result.exitCode;
-      stepMeta.cancelled = result.cancelled;
-      stepMeta.timeout = result.timedOut;
+      break;
+    }
 
-      if (result.cancelled) {
-        cancelled = true;
-        lastExitCode = effectiveExitCode;
-      } else if (result.timedOut) {
-        timedOut = true;
-        lastExitCode = effectiveExitCode;
-      } else {
-        lastExitCode = effectiveExitCode;
-      }
+    const parts = splitArgs(command);
+    const [bin, ...args] = parts;
+    if (!bin) {
+      appendSystemLog(sender, runId, outputStream, "Command parse failed\n");
+      stepMeta.exit_code = -1;
+      lastExitCode = -1;
+      stepMeta.ended_at = new Date().toISOString();
+      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      await writeRunMeta(runDir, runMeta);
+      break;
+    }
+    appendSystemLog(sender, runId, outputStream, `[cmd] argv0=${bin} argc=${args.length}\n`);
+    const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
+    const stdout = result.stdout.trim();
+    const isGrep = command.startsWith("git grep");
+    const isGrepNoMatch = isGrep && result.exitCode === 1;
+    const effectiveExitCode = isGrepNoMatch ? 0 : result.exitCode;
+    if (isGrepNoMatch) {
+      appendSystemLog(sender, runId, outputStream, "[precheck] no matches\n");
+    }
+    const isPrecheck =
+      command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
+    lastPrecheckHit = isPrecheck && Boolean(stdout);
+    stepMeta.exit_code = result.exitCode;
+    stepMeta.cancelled = result.cancelled;
+    stepMeta.timeout = result.timedOut;
+
+    if (result.cancelled) {
+      cancelled = true;
+      lastExitCode = effectiveExitCode;
+    } else if (result.timedOut) {
+      timedOut = true;
+      lastExitCode = effectiveExitCode;
+    } else {
+      lastExitCode = effectiveExitCode;
+    }
 
     const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
     stepMeta.evidence = evidence;
@@ -1147,9 +1256,9 @@ const runPlanInternal = async (
     (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
     await writeRunMeta(runDir, runMeta);
 
-      if (result.cancelled || result.timedOut || effectiveExitCode !== 0) {
-        break;
-      }
+    if (result.cancelled || result.timedOut || effectiveExitCode !== 0) {
+      break;
+    }
 
     const decisionResult = await maybeRequestDecision(
       evidence,
