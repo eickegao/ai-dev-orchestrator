@@ -54,6 +54,9 @@ const isGitRepo = async (workspacePath: string) => {
 const isCommandAllowed = (command: string) =>
   ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
 
+type PlanStep = { type: "cmd"; command: string } | { type: "note"; text: string };
+type TaskPlan = { plan_name: string; steps: PlanStep[] };
+
 type ActiveRun = {
   runId: string;
   workspacePath: string;
@@ -67,8 +70,24 @@ type ActiveRun = {
   timedOut: boolean;
 };
 
+type ActivePlan = {
+  runId: string;
+  workspacePath: string;
+  runDir: string;
+  outputStream: fs.WriteStream;
+  sender: WebContents;
+  cancelled: boolean;
+};
+
+type DecisionWaiter = {
+  runDir: string;
+  files: string[];
+  resolve: (result: "approved" | "rejected") => void;
+};
+
 let activeRun: ActiveRun | null = null;
-const pendingDecisions = new Map<string, { runDir: string; files: string[] }>();
+let activePlan: ActivePlan | null = null;
+const pendingDecisions = new Map<string, DecisionWaiter>();
 
 const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
   await fs.promises.writeFile(
@@ -76,6 +95,17 @@ const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
     JSON.stringify(meta, null, 2),
     "utf-8"
   );
+};
+
+const mergeDecisionFromDisk = async (runDir: string, meta: Record<string, unknown>) => {
+  try {
+    const existing = JSON.parse(await fs.promises.readFile(path.join(runDir, "run.json"), "utf-8"));
+    if (existing.decision) {
+      meta.decision = existing.decision;
+    }
+  } catch {
+    // Ignore missing/invalid run.json while plan is still running.
+  }
 };
 
 const appendSystemLog = (sender: WebContents, runId: string, outputStream: fs.WriteStream, text: string) => {
@@ -189,16 +219,15 @@ const maybeRequestDecision = async (
   runDir: string,
   sender: WebContents,
   outputStream: fs.WriteStream
-) => {
-  if ("error" in evidence) return;
+): Promise<"approved" | "rejected" | null> => {
+  if ("error" in evidence) return null;
   const nameOnly = evidence.git_diff_name_only;
-  if (!nameOnly) return;
+  if (!nameOnly) return null;
 
   const changedFiles = parseNameOnly(nameOnly);
   const dependencyFiles = matchDependencyFiles(changedFiles);
-  if (dependencyFiles.length === 0) return;
+  if (dependencyFiles.length === 0) return null;
 
-  pendingDecisions.set(runId, { runDir, files: dependencyFiles });
   appendSystemLog(
     sender,
     runId,
@@ -206,7 +235,72 @@ const maybeRequestDecision = async (
     `Dependency changes detected. Awaiting approval: ${dependencyFiles.join(", ")}\n`
   );
   sender.send("run:decision", { runId, files: dependencyFiles });
+
+  return new Promise((resolve) => {
+    pendingDecisions.set(runId, { runDir, files: dependencyFiles, resolve });
+  });
 };
+
+const runCommandStreaming = (
+  command: string,
+  args: string[],
+  workspacePath: string,
+  runId: string,
+  sender: WebContents,
+  outputStream: fs.WriteStream
+) =>
+  new Promise<{ exitCode: number; cancelled: boolean; timedOut: boolean }>((resolve) => {
+    const child = spawn(command, args, { cwd: workspacePath });
+    const timeoutId = setTimeout(() => {
+      if (!activeRun || activeRun.runId !== runId) return;
+      activeRun.timedOut = true;
+      appendSystemLog(sender, runId, outputStream, "[Timeout exceeded]\n");
+      terminateProcess(child);
+    }, RUN_TIMEOUT_MS);
+
+    activeRun = {
+      runId,
+      workspacePath,
+      command: `${command} ${args.join(" ")}`.trim(),
+      startTime: new Date().toISOString(),
+      runDir: "",
+      outputStream,
+      child,
+      timeoutId,
+      cancelled: false,
+      timedOut: false
+    };
+
+    const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
+      const text = chunk.toString();
+      outputStream.write(text);
+      sender.send("run:output", { runId, source, text });
+    };
+
+    child.stdout.on("data", (chunk) => sendChunk("stdout", chunk));
+    child.stderr.on("data", (chunk) => sendChunk("stderr", chunk));
+
+    child.on("close", (code) => {
+      if (activeRun?.runId === runId) {
+        clearTimeout(activeRun.timeoutId);
+      }
+      const cancelled = activeRun?.cancelled ?? false;
+      const timedOut = activeRun?.timedOut ?? false;
+      activeRun = null;
+      resolve({ exitCode: code ?? -1, cancelled, timedOut });
+    });
+
+    child.on("error", (error) => {
+      if (activeRun?.runId === runId) {
+        clearTimeout(activeRun.timeoutId);
+      }
+      appendSystemLog(sender, runId, outputStream, `Command error: ${error.message}\n`);
+      const cancelled = activeRun?.cancelled ?? false;
+      const timedOut = activeRun?.timedOut ?? false;
+      activeRun = null;
+      resolve({ exitCode: -1, cancelled, timedOut });
+    });
+  });
 
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
@@ -227,9 +321,17 @@ const registerIpc = () => {
     return runsRoot;
   });
 
-  ipcMain.handle("run:git-status", async (event, workspacePath: string) => {
+  ipcMain.handle("run:plan", async (event, payload: { workspacePath: string; plan: TaskPlan }) => {
+    if (activePlan) {
+      throw new Error("Another run is already active");
+    }
+
+    const { workspacePath, plan } = payload;
     if (!workspacePath) {
       throw new Error("Workspace not set");
+    }
+    if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
+      throw new Error("Plan is empty");
     }
 
     const isRepo = await isGitRepo(workspacePath);
@@ -239,130 +341,158 @@ const registerIpc = () => {
 
     const runId = String(Date.now());
     const startTime = new Date().toISOString();
-    const command = "git status -sb";
     const runDir = await ensureRunDir(runId);
     const outputPath = path.join(runDir, "output.log");
     const outputStream = fs.createWriteStream(outputPath, { flags: "a" });
+    const totalSteps = plan.steps.length;
 
-    if (!isCommandAllowed(command)) {
-      appendSystemLog(event.sender, runId, outputStream, "Command not allowed by policy\n");
-      const endTime = new Date().toISOString();
-      const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-      await writeRunMeta(runDir, {
-        run_id: runId,
-        workspacePath,
-        command,
-        startTime,
-        endTime,
-        exitCode: -1,
-        blocked_by_policy: true,
-        evidence
-      });
-      await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
-      outputStream.end();
-      event.sender.send("run:done", { runId, exitCode: -1 });
-      return runId;
-    }
-
-    const child = spawn("git", ["status", "-sb"], { cwd: workspacePath });
-    const timeoutId = setTimeout(() => {
-      if (!activeRun || activeRun.runId !== runId) return;
-      activeRun.timedOut = true;
-      appendSystemLog(event.sender, runId, outputStream, "[Timeout exceeded]\n");
-      terminateProcess(child);
-    }, RUN_TIMEOUT_MS);
-
-    activeRun = {
+    activePlan = {
       runId,
       workspacePath,
-      command,
-      startTime,
       runDir,
       outputStream,
-      child,
-      timeoutId,
-      cancelled: false,
-      timedOut: false
+      sender: event.sender,
+      cancelled: false
     };
 
-    const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
-      const text = chunk.toString();
-      outputStream.write(text);
-      event.sender.send("run:output", { runId, source, text });
+    const runMeta: Record<string, unknown> = {
+      run_id: runId,
+      workspacePath,
+      startTime,
+      plan: {
+        name: plan.plan_name,
+        stepsCount: totalSteps
+      },
+      steps: []
     };
 
-    child.stdout.on("data", (chunk) => sendChunk("stdout", chunk));
-    child.stderr.on("data", (chunk) => sendChunk("stderr", chunk));
+    let lastExitCode = 0;
+    let blockedByPolicy = false;
+    let timedOut = false;
+    let cancelled = false;
+    let cancelledByDecision = false;
 
-    child.on("close", async (code) => {
-      const endTime = new Date().toISOString();
-      if (activeRun?.runId === runId) {
-        clearTimeout(activeRun.timeoutId);
+    for (let index = 0; index < plan.steps.length; index += 1) {
+      if (activePlan.cancelled) {
+        cancelled = true;
+        lastExitCode = -1;
+        break;
+      }
+
+      const step = plan.steps[index];
+      event.sender.send("run:step", { runId, stepIndex: index + 1, total: totalSteps });
+
+      const stepMeta: Record<string, unknown> = {
+        step_index: index + 1,
+        type: step.type,
+        started_at: new Date().toISOString()
+      };
+
+      if (step.type === "note") {
+        appendSystemLog(event.sender, runId, outputStream, `Note: ${step.text}\n`);
+        stepMeta.ended_at = new Date().toISOString();
+        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+        await writeRunMeta(runDir, runMeta);
+        continue;
+      }
+
+      const command = step.command;
+      stepMeta.command = command;
+
+      if (!isCommandAllowed(command)) {
+        appendSystemLog(event.sender, runId, outputStream, "Command not allowed by policy\n");
+        stepMeta.blocked_by_policy = true;
+        stepMeta.exit_code = -1;
+        blockedByPolicy = true;
+        lastExitCode = -1;
+        const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
+        stepMeta.evidence = evidence;
+        runMeta.evidence = evidence;
+        stepMeta.ended_at = new Date().toISOString();
+        (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+        await writeRunMeta(runDir, runMeta);
+        const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
+        if (decisionResult) {
+          await mergeDecisionFromDisk(runDir, runMeta);
+        }
+        break;
+      }
+
+      const parts = command.split(" ").filter(Boolean);
+      const [bin, ...args] = parts;
+      const result = await runCommandStreaming(bin, args, workspacePath, runId, event.sender, outputStream);
+      stepMeta.exit_code = result.exitCode;
+      stepMeta.cancelled = result.cancelled;
+      stepMeta.timeout = result.timedOut;
+
+      if (result.cancelled) {
+        cancelled = true;
+        lastExitCode = result.exitCode;
+      } else if (result.timedOut) {
+        timedOut = true;
+        lastExitCode = result.exitCode;
+      } else {
+        lastExitCode = result.exitCode;
       }
 
       const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-      const runMeta = {
-        run_id: runId,
-        workspacePath,
-        command,
-        startTime,
-        endTime,
-        exitCode: code ?? -1,
-        cancelled: activeRun?.cancelled ?? false,
-        timeout: activeRun?.timedOut ?? false,
-        evidence
-      };
-
+      stepMeta.evidence = evidence;
+      runMeta.evidence = evidence;
+      stepMeta.ended_at = new Date().toISOString();
+      (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
       await writeRunMeta(runDir, runMeta);
-      await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
 
-      outputStream.end();
-      event.sender.send("run:done", { runId, exitCode: code ?? -1 });
-      if (activeRun?.runId === runId) {
-        activeRun = null;
-      }
-    });
-
-    child.on("error", async (error) => {
-      const endTime = new Date().toISOString();
-      if (activeRun?.runId === runId) {
-        clearTimeout(activeRun.timeoutId);
+      if (result.cancelled || result.timedOut || result.exitCode !== 0) {
+        break;
       }
 
-      const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
-      const runMeta = {
-        run_id: runId,
-        workspacePath,
-        command,
-        startTime,
-        endTime,
-        exitCode: -1,
-        error: error.message,
-        cancelled: activeRun?.cancelled ?? false,
-        timeout: activeRun?.timedOut ?? false,
-        evidence
-      };
-
-      await writeRunMeta(runDir, runMeta);
-      await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
-
-      outputStream.end();
-      event.sender.send("run:done", { runId, exitCode: -1 });
-      if (activeRun?.runId === runId) {
-        activeRun = null;
+      const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
+      if (decisionResult) {
+        await mergeDecisionFromDisk(runDir, runMeta);
+        if (decisionResult === "rejected") {
+          cancelledByDecision = true;
+          break;
+        }
+        if (activePlan.cancelled) {
+          cancelled = true;
+          lastExitCode = -1;
+          break;
+        }
       }
-    });
+    }
 
+    const endTime = new Date().toISOString();
+    await mergeDecisionFromDisk(runDir, runMeta);
+    runMeta.endTime = endTime;
+    runMeta.exitCode = lastExitCode;
+    if (blockedByPolicy) runMeta.blocked_by_policy = true;
+    if (timedOut) runMeta.timeout = true;
+    if (cancelled) runMeta.cancelled = true;
+    if (cancelledByDecision) runMeta.cancelled_by_decision = true;
+
+    await writeRunMeta(runDir, runMeta);
+    outputStream.end();
+    event.sender.send("run:done", { runId, exitCode: lastExitCode });
+
+    activePlan = null;
     return runId;
   });
 
   ipcMain.handle("run:cancel", async (event, runId: string) => {
-    if (!activeRun || activeRun.runId !== runId) {
+    if (!activePlan || activePlan.runId !== runId) {
       return false;
     }
-    activeRun.cancelled = true;
-    appendSystemLog(event.sender, runId, activeRun.outputStream, "[Cancelled by user]\n");
-    terminateProcess(activeRun.child);
+    activePlan.cancelled = true;
+    appendSystemLog(event.sender, runId, activePlan.outputStream, "[Cancelled by user]\n");
+    if (activeRun && activeRun.runId === runId) {
+      activeRun.cancelled = true;
+      terminateProcess(activeRun.child);
+    }
+    const pending = pendingDecisions.get(runId);
+    if (pending) {
+      pending.resolve("rejected");
+      pendingDecisions.delete(runId);
+    }
     event.sender.send("run:cancelled", { runId });
     return true;
   });
@@ -381,6 +511,7 @@ const registerIpc = () => {
         files: pending.files
       };
       await writeRunMeta(pending.runDir, { ...existing, decision });
+      pending.resolve(payload.result);
       pendingDecisions.delete(payload.runId);
       return true;
     }

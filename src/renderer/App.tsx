@@ -11,6 +11,14 @@ type DecisionState = {
   files: string[];
 };
 
+const defaultPlan = {
+  plan_name: "Default plan",
+  steps: [
+    { type: "note", text: "Starting plan." },
+    { type: "cmd", command: "git status -sb" }
+  ]
+} as const;
+
 const App = () => {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
   const [runsRoot, setRunsRoot] = useState<string | null>(null);
@@ -20,6 +28,7 @@ const App = () => {
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [decision, setDecision] = useState<DecisionState | null>(null);
+  const [stepProgress, setStepProgress] = useState<{ current: number; total: number } | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -38,7 +47,7 @@ const App = () => {
     }
   };
 
-  const runGitStatus = async () => {
+  const runPlan = async () => {
     if (!workspacePath) {
       appendLog({
         id: `${Date.now()}-error`,
@@ -60,12 +69,12 @@ const App = () => {
     setIsRunning(true);
     appendLog({
       id: `${Date.now()}-run`,
-      text: "Running: git status -sb\n",
+      text: `Running plan: ${defaultPlan.plan_name}\n`,
       source: "system"
     });
 
     try {
-      const runId = await window.api.runGitStatus(workspacePath);
+      const runId = await window.api.runPlan({ workspacePath, plan: defaultPlan });
       setCurrentRunId(runId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -76,6 +85,7 @@ const App = () => {
       });
       setIsRunning(false);
       setCurrentRunId(null);
+      setStepProgress(null);
     }
   };
 
@@ -132,6 +142,7 @@ const App = () => {
       });
       setIsRunning(false);
       setCurrentRunId(null);
+      setStepProgress(null);
     });
 
     const unsubscribeCancelled = window.api.onRunCancelled((payload) => {
@@ -142,6 +153,11 @@ const App = () => {
       });
       setIsRunning(false);
       setCurrentRunId(null);
+      setStepProgress(null);
+    });
+
+    const unsubscribeStep = window.api.onRunStep((payload) => {
+      setStepProgress({ current: payload.stepIndex, total: payload.total });
     });
 
     const unsubscribeDecision = window.api.onDecisionRequired((payload) => {
@@ -157,6 +173,7 @@ const App = () => {
       isMounted = false;
       unsubscribeOutput();
       unsubscribeDone();
+      unsubscribeStep();
       unsubscribeCancelled();
       unsubscribeDecision();
     };
@@ -176,13 +193,16 @@ const App = () => {
           <h1>AI Dev Orchestrator</h1>
           <p className="muted">Workspace: {workspacePath ?? "(not set)"}</p>
           <p className="muted">Runs: {runsRoot ?? "(loading...)"}</p>
+          <p className="muted">
+            Step: {stepProgress ? `${stepProgress.current}/${stepProgress.total}` : "(idle)"}
+          </p>
         </div>
         <div className="actions">
           <button className="secondary" onClick={selectWorkspace}>
             Select Workspace
           </button>
-          <button className="primary" onClick={runGitStatus} disabled={isRunning || !!decision}>
-            Run git status
+          <button className="primary" onClick={runPlan} disabled={isRunning || !!decision}>
+            Run Plan
           </button>
           <button className="secondary" onClick={cancelRun} disabled={!isRunning}>
             Cancel

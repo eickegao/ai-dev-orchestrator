@@ -7,8 +7,8 @@ contextBridge.exposeInMainWorld("appInfo", {
 
 contextBridge.exposeInMainWorld("api", {
   selectWorkspace: async () => ipcRenderer.invoke("workspace:select"),
-  runGitStatus: async (workspacePath: string) =>
-    ipcRenderer.invoke("run:git-status", workspacePath),
+  runPlan: async (payload: { workspacePath: string; plan: { plan_name: string; steps: Array<{ type: "cmd"; command: string } | { type: "note"; text: string }> } }) =>
+    ipcRenderer.invoke("run:plan", payload),
   cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),
   submitDecision: async (payload: { runId: string; result: "approved" | "rejected" }) =>
     ipcRenderer.invoke("run:decision", payload),
@@ -26,6 +26,13 @@ contextBridge.exposeInMainWorld("api", {
     };
     ipcRenderer.on("run:done", listener);
     return () => ipcRenderer.removeListener("run:done", listener);
+  },
+  onRunStep: (callback: (payload: { runId: string; stepIndex: number; total: number }) => void) => {
+    const listener = (_event: unknown, payload: { runId: string; stepIndex: number; total: number }) => {
+      callback(payload);
+    };
+    ipcRenderer.on("run:step", listener);
+    return () => ipcRenderer.removeListener("run:step", listener);
   },
   onRunCancelled: (callback: (payload: { runId: string }) => void) => {
     const listener = (_event: unknown, payload: { runId: string }) => {
