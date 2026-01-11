@@ -620,6 +620,14 @@ const runExecutorStreaming = async (
   return applyResult;
 };
 
+const buildRetryInstructions = () =>
+  [
+    "ONLY edit src/renderer/App.tsx.",
+    "Ensure that after applying changes, `git diff --name-only` is non-empty and includes src/renderer/App.tsx.",
+    "If the feature already exists, do not duplicate UI; make a minimal fix to behavior or wiring so a real diff is produced.",
+    "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install."
+  ].join(" ");
+
 const registerIpc = () => {
   ipcMain.handle("workspace:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -750,7 +758,7 @@ const registerIpc = () => {
           break;
         }
 
-        const result = await runExecutorStreaming(
+        let result = await runExecutorStreaming(
           tool,
           step.instructions,
           workspacePath,
@@ -765,16 +773,6 @@ const registerIpc = () => {
           stepMeta.error = result.error;
         }
 
-        if (result.cancelled) {
-          cancelled = true;
-          lastExitCode = result.exitCode;
-        } else if (result.timedOut) {
-          timedOut = true;
-          lastExitCode = result.exitCode;
-        } else {
-          lastExitCode = result.exitCode;
-        }
-
         const evidence = await collectGitEvidence(workspacePath, event.sender, runId, outputStream);
         let changedFiles: string[] = [];
         if (!("error" in evidence) && typeof evidence.git_diff_name_only === "string") {
@@ -783,13 +781,85 @@ const registerIpc = () => {
         const hasChanges = changedFiles.length > 0;
         const evaluation: Record<string, unknown> = {
           changed_files: changedFiles,
-          has_changes: hasChanges
+          has_changes: hasChanges,
+          retried: false
         };
         if (result.exitCode === 0 && !hasChanges) {
           evaluation.suspicious_no_change = true;
         }
-        if (lastPrecheckHit && !hasChanges) {
+        if (result.exitCode === 0 && lastPrecheckHit && !hasChanges) {
           evaluation.no_op = true;
+        }
+        if (evaluation.no_op) {
+          appendSystemLog(
+            event.sender,
+            runId,
+            outputStream,
+            "[auto] no-op detected from precheck; skipping modification retry\n"
+          );
+          const grepResult = await runCommandCapture(
+            "git",
+            ["grep", "-n", "Clear Logs", "--", "src/renderer/App.tsx"],
+            workspacePath
+          );
+          if (grepResult.stdout) {
+            appendSystemLog(event.sender, runId, outputStream, grepResult.stdout);
+          }
+          if (grepResult.stderr) {
+            appendSystemLog(event.sender, runId, outputStream, grepResult.stderr);
+          }
+        } else if (evaluation.suspicious_no_change) {
+          evaluation.retried = true;
+          const retryInstructions = buildRetryInstructions();
+          const retryResult = await runExecutorStreaming(
+            tool,
+            retryInstructions,
+            workspacePath,
+            runId,
+            event.sender,
+            outputStream
+          );
+          let retryChanged: string[] = [];
+          const retryDiff = await runCommandCapture(
+            "git",
+            ["diff", "--name-only"],
+            workspacePath
+          );
+          if (retryDiff.code === 0 && retryDiff.stdout) {
+            retryChanged = parseNameOnly(retryDiff.stdout);
+          }
+          const retryHasChanges = retryChanged.length > 0;
+          evaluation.retry_result = {
+            exit_code: retryResult.exitCode,
+            changed_files: retryChanged,
+            has_changes: retryHasChanges
+          };
+          if (!retryHasChanges) {
+            appendSystemLog(
+              event.sender,
+              runId,
+              outputStream,
+              "[auto] retry produced no changes; user attention may be required\n"
+            );
+          }
+
+          result = retryResult;
+          stepMeta.exit_code = retryResult.exitCode;
+          stepMeta.cancelled = retryResult.cancelled;
+          stepMeta.timeout = retryResult.timedOut;
+          if (retryResult.error) {
+            stepMeta.error = retryResult.error;
+          }
+        }
+
+        if (result.cancelled) {
+          cancelled = true;
+          lastExitCode = result.exitCode;
+        } else if (result.timedOut) {
+          timedOut = true;
+          lastExitCode = result.exitCode;
+        } else {
+          lastExitCode = result.exitCode;
         }
         stepMeta.evaluation = evaluation;
         appendSystemLog(
@@ -800,8 +870,12 @@ const registerIpc = () => {
             evaluation.suspicious_no_change
           )} no_op=${Boolean(evaluation.no_op)}\n`
         );
-        stepMeta.evidence = evidence;
-        runMeta.evidence = evidence;
+        const finalEvidence =
+          evaluation.retried === true
+            ? await collectGitEvidence(workspacePath, event.sender, runId, outputStream)
+            : evidence;
+        stepMeta.evidence = finalEvidence;
+        runMeta.evidence = finalEvidence;
         stepMeta.ended_at = new Date().toISOString();
         (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
         await writeRunMeta(runDir, runMeta);
@@ -811,7 +885,7 @@ const registerIpc = () => {
           break;
         }
 
-        const decisionResult = await maybeRequestDecision(evidence, runId, runDir, event.sender, outputStream);
+        const decisionResult = await maybeRequestDecision(finalEvidence, runId, runDir, event.sender, outputStream);
         if (decisionResult) {
           await mergeDecisionFromDisk(runDir, runMeta);
           if (decisionResult === "rejected") {
