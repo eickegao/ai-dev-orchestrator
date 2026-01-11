@@ -41,10 +41,138 @@ const DEPENDENCY_FILES = new Set([
 
 const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrator", "data", "runs");
 
+const CAPABILITY_CARD = [
+  "Orchestrator Capability Card",
+  "- step types: cmd, note, executor",
+  '- executor: codex via `codex exec -C <workspace> --full-auto \"<instructions>\"` then `codex apply -C <workspace>`',
+  "- supports evidence: git status --porcelain, git diff --stat, git diff --name-only",
+  "- supports decision: dependency change approval prompt",
+  "- supports cancel/timeout handling",
+  "- evaluation fields: has_changes, changed_files, suspicious_no_change, no_op, retry_result (baseline diff aware)",
+  "- policy: cmd allowlist is git-only; NEVER git add/commit/push"
+].join("\n");
+
 const ensureRunDir = async (runId: string) => {
   const baseDir = path.join(getRunsRoot(), runId);
   await fs.promises.mkdir(baseDir, { recursive: true });
   return baseDir;
+};
+
+const getLatestRunDir = async () => {
+  const runsRoot = getRunsRoot();
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(runsRoot, { withFileTypes: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { runDir: null, reason: `runs root unavailable: ${message}` };
+  }
+
+  let latestDir: string | null = null;
+  let latestMtime = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const fullPath = path.join(runsRoot, entry.name);
+    try {
+      const stat = await fs.promises.stat(fullPath);
+      if (stat.mtimeMs > latestMtime) {
+        latestMtime = stat.mtimeMs;
+        latestDir = fullPath;
+      }
+    } catch {
+      // ignore stat errors for unrelated entries
+    }
+  }
+
+  if (!latestDir) {
+    return { runDir: null, reason: "no runs found" };
+  }
+
+  return { runDir: latestDir, reason: "" };
+};
+
+const buildLastRunSummary = async () => {
+  const { runDir, reason } = await getLatestRunDir();
+  if (!runDir) {
+    return {
+      summary: `(no last run summary available: ${reason})`,
+      found: false
+    };
+  }
+
+  const runPath = path.join(runDir, "run.json");
+  try {
+    const raw = await fs.promises.readFile(runPath, "utf-8");
+    const run = JSON.parse(raw) as Record<string, unknown>;
+    const steps = Array.isArray(run.steps) ? (run.steps as Record<string, unknown>[]) : [];
+
+    let lastExecutorEval: Record<string, unknown> | null = null;
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      const step = steps[i];
+      if (step?.type === "executor") {
+        const evaluation = (step.evaluation ?? null) as Record<string, unknown> | null;
+        if (evaluation) lastExecutorEval = evaluation;
+        break;
+      }
+    }
+
+    const summary: Record<string, string> = {
+      run_id: String(run.run_id ?? ""),
+      started_at: String(run.startTime ?? ""),
+      ended_at: String(run.endTime ?? ""),
+      workspace: String(run.workspacePath ?? ""),
+      plan_name: String((run.plan as Record<string, unknown> | undefined)?.name ?? "")
+    };
+
+    const evaluationLines: string[] = [];
+    if (lastExecutorEval) {
+      const changedFiles = Array.isArray(lastExecutorEval.changed_files)
+        ? (lastExecutorEval.changed_files as string[]).slice(0, 10)
+        : [];
+      const retryResult = (lastExecutorEval.retry_result ?? null) as Record<string, unknown> | null;
+      evaluationLines.push(`has_changes: ${Boolean(lastExecutorEval.has_changes)}`);
+      evaluationLines.push(`changed_files: ${changedFiles.join(", ") || "(none)"}`);
+      evaluationLines.push(`suspicious_no_change: ${Boolean(lastExecutorEval.suspicious_no_change)}`);
+      evaluationLines.push(`no_op: ${Boolean(lastExecutorEval.no_op)}`);
+      evaluationLines.push(`retried: ${Boolean(lastExecutorEval.retried)}`);
+      if (retryResult) {
+        evaluationLines.push(`retry_has_changes: ${Boolean(retryResult.has_changes)}`);
+      }
+      const baselineCount = Array.isArray(lastExecutorEval.baseline_files)
+        ? lastExecutorEval.baseline_files.length
+        : 0;
+      const currentCount = Array.isArray(lastExecutorEval.current_files)
+        ? lastExecutorEval.current_files.length
+        : 0;
+      evaluationLines.push(`baseline_files_count: ${baselineCount}`);
+      evaluationLines.push(`current_files_count: ${currentCount}`);
+    }
+
+    const decision = run.decision as Record<string, unknown> | undefined;
+    const decisionLine = decision ? `decision: ${String(decision.result ?? "")}` : "";
+
+    const summaryText = [
+      "Last Run Summary",
+      `run_id: ${summary.run_id}`,
+      `started_at: ${summary.started_at}`,
+      `ended_at: ${summary.ended_at}`,
+      `workspace: ${summary.workspace}`,
+      `plan_name: ${summary.plan_name}`,
+      evaluationLines.length ? `executor_evaluation: ${evaluationLines.join("; ")}` : "",
+      decisionLine
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, 1200);
+
+    return { summary: summaryText, found: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      summary: `(no last run summary available: ${message})`,
+      found: false
+    };
+  }
 };
 
 const isGitRepo = async (workspacePath: string) => {
@@ -280,7 +408,18 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
     throw new Error("OPENAI_API_KEY is not set");
   }
 
+  const { summary, found } = await buildLastRunSummary();
+  console.log(`[planner] lastRunFound: ${found}`);
+  console.log(`[planner] lastRunSummaryLength: ${summary.length}`);
+  console.log(`[planner] capabilityCardLength: ${CAPABILITY_CARD.length}`);
+
   const systemPrompt = await loadPlannerSystemPrompt();
+  const userPrompt = [
+    CAPABILITY_CARD,
+    summary,
+    "Requirement:",
+    requirement.trim()
+  ].join("\n");
   const response = await fetch(OPENAI_API_URL, {
     method: "POST",
     headers: {
@@ -292,7 +431,7 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
       temperature: 0.2,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: requirement.trim() }
+        { role: "user", content: userPrompt }
       ]
     })
   });
