@@ -322,12 +322,14 @@ const registerIpc = () => {
     return runsRoot;
   });
 
-  ipcMain.handle("run:plan", async (event, payload: { workspacePath: string; plan: TaskPlan }) => {
+  ipcMain.handle(
+    "run:plan",
+    async (event, payload: { workspacePath: string; plan: TaskPlan; requirement?: string }) => {
     if (activePlan) {
       throw new Error("Another run is already active");
     }
 
-    const { workspacePath, plan } = payload;
+    const { workspacePath, plan, requirement } = payload;
     if (!workspacePath) {
       throw new Error("Workspace not set");
     }
@@ -360,6 +362,7 @@ const registerIpc = () => {
       run_id: runId,
       workspacePath,
       startTime,
+      requirement: requirement ? requirement.trim() : "",
       plan: {
         name: plan.plan_name,
         stepsCount: totalSteps

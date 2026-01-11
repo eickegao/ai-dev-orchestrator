@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("api", {
   runPlan: async (payload: {
     workspacePath: string;
     plan: { plan_name: string; steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }> };
+    requirement?: string;
   }) =>
     ipcRenderer.invoke("run:plan", payload),
   cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),

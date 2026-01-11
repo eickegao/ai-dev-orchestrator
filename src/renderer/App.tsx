@@ -37,6 +37,7 @@ const App = () => {
   const [planInput, setPlanInput] = useState(() => JSON.stringify(defaultPlan, null, 2));
   const [planError, setPlanError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [requirement, setRequirement] = useState("");
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -126,7 +127,7 @@ const App = () => {
     });
 
     try {
-      const runId = await window.api.runPlan({ workspacePath, plan });
+      const runId = await window.api.runPlan({ workspacePath, plan, requirement });
       setCurrentRunId(runId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -189,6 +190,11 @@ const App = () => {
     const storedPlan = window.localStorage.getItem("planEditor");
     if (storedPlan) {
       setPlanInput(storedPlan);
+    }
+
+    const storedRequirement = window.localStorage.getItem("requirementInput");
+    if (storedRequirement) {
+      setRequirement(storedRequirement);
     }
 
     if (!window.api) {
@@ -259,6 +265,10 @@ const App = () => {
   }, [planInput]);
 
   useEffect(() => {
+    window.localStorage.setItem("requirementInput", requirement);
+  }, [requirement]);
+
+  useEffect(() => {
     if (!logRef.current) return;
     logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logEntries]);
@@ -274,6 +284,9 @@ const App = () => {
           <p className="muted">Runs: {runsRoot ?? "(loading...)"}</p>
           <p className="muted">
             Step: {stepProgress ? `${stepProgress.current}/${stepProgress.total}` : "(idle)"}
+          </p>
+          <p className="muted">
+            Requirement: {requirement.trim() ? requirement.trim().slice(0, 80) : "(not set)"}
           </p>
           {apiError && <p className="error">{apiError}</p>}
         </div>
@@ -304,6 +317,17 @@ const App = () => {
             Use Default Plan
           </button>
         </div>
+      </section>
+
+      <section className="panel">
+        <h2>Requirement</h2>
+        <textarea
+          className="input"
+          value={requirement}
+          rows={4}
+          onChange={(event) => setRequirement(event.target.value)}
+          placeholder="Describe your requirement..."
+        />
       </section>
 
       {decision && (
