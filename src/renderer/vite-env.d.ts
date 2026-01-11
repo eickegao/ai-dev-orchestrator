@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 
+import type { TaskPlan } from "../shared/protocol";
+
 declare global {
   interface Window {
     appInfo: {
@@ -10,12 +12,10 @@ declare global {
       selectWorkspace: () => Promise<string | null>;
       runPlan: (payload: {
         workspacePath: string;
-        plan: {
-          plan_name: string;
-          steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }>;
-        };
+        plan: TaskPlan;
         requirement?: string;
       }) => Promise<string>;
+      generatePlan: (requirement: string) => Promise<TaskPlan>;
       cancelRun: (runId: string) => Promise<boolean>;
       submitDecision: (payload: { runId: string; result: "approved" | "rejected" }) => Promise<boolean>;
       getRunsRoot: () => Promise<string>;

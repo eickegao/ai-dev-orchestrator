@@ -3,6 +3,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { ZodError } from "zod";
+import { TaskPlanSchema, type TaskPlan } from "../shared/protocol";
 
 const createWindow = () => {
   const preloadPath = path.join(__dirname, "preload.js");
@@ -27,6 +29,8 @@ const createWindow = () => {
 
 const RUN_TIMEOUT_MS = 30_000;
 const ALLOWED_COMMAND_PREFIXES = ["git"];
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_MODEL = "gpt-4o-mini";
 const DEPENDENCY_FILES = new Set([
   "package.json",
   "package-lock.json",
@@ -55,8 +59,19 @@ const isGitRepo = async (workspacePath: string) => {
 const isCommandAllowed = (command: string) =>
   ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
 
-type PlanStep = { type: "cmd"; command: string } | { type: "note"; message: string };
-type TaskPlan = { plan_name: string; steps: PlanStep[] };
+const PLAN_SYSTEM_PROMPT = [
+  "You are a software development task planner.",
+  "Output must be strict JSON and must not include markdown or extra text.",
+  "Schema:",
+  '{ "plan_name": string, "steps": [ { "type": "note", "message": string } | { "type": "cmd", "command": string } ] }',
+  "Constraints:",
+  '- step.type must be only "note" or "cmd".',
+  `- cmd.command must start with one of: ${ALLOWED_COMMAND_PREFIXES.join(", ") || "none"}.`,
+  "- no more than 8 steps.",
+  "- include at least 1 note step.",
+  '- the last step should be "git status -sb" or "git diff --stat" when possible.',
+  "Return JSON only."
+].join("\n");
 
 type ActiveRun = {
   runId: string;
@@ -140,6 +155,105 @@ const matchDependencyFiles = (files: string[]) => {
     }
   }
   return Array.from(matched);
+};
+
+const formatZodError = (error: ZodError) =>
+  error.issues
+    .map((issue) => {
+      const path = issue.path.length ? issue.path.join(".") : "plan";
+      return `${path}: ${issue.message}`;
+    })
+    .join("; ");
+
+const validateGeneratedPlan = (plan: TaskPlan) => {
+  const issues: string[] = [];
+
+  if (plan.steps.length > 8) {
+    issues.push("plan must have at most 8 steps");
+  }
+
+  if (!plan.steps.some((step) => step.type === "note")) {
+    issues.push("plan must include at least 1 note step");
+  }
+
+  for (const step of plan.steps) {
+    if (step.type !== "cmd") continue;
+    const command = step.command.trim();
+    if (!command) {
+      issues.push("cmd.command cannot be empty");
+      continue;
+    }
+    if (!isCommandAllowed(command)) {
+      issues.push(`cmd.command not allowed: ${command}`);
+    }
+  }
+
+  if (issues.length > 0) {
+    throw new Error(issues.join("; "));
+  }
+};
+
+const generatePlanFromRequirement = async (requirement: string): Promise<TaskPlan> => {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is not set");
+  }
+
+  const response = await fetch(OPENAI_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: PLAN_SYSTEM_PROMPT },
+        { role: "user", content: requirement.trim() }
+      ]
+    })
+  });
+
+  if (!response.ok) {
+    let message = `OpenAI API error (${response.status})`;
+    try {
+      const data = await response.json();
+      if (data?.error?.message) {
+        message = data.error.message;
+      }
+    } catch {
+      // keep fallback message
+    }
+    throw new Error(message);
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data?.choices?.[0]?.message?.content?.trim();
+  if (!content) {
+    throw new Error("OpenAI response missing content");
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(content);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON from planner: ${message}`);
+  }
+
+  try {
+    const plan = TaskPlanSchema.parse(parsedJson);
+    validateGeneratedPlan(plan);
+    return plan;
+  } catch (error) {
+    if (error instanceof ZodError) {
+      throw new Error(`Plan schema validation failed: ${formatZodError(error)}`);
+    }
+    throw error;
+  }
 };
 
 const runCommandCapture = (
@@ -320,6 +434,13 @@ const registerIpc = () => {
     const runsRoot = getRunsRoot();
     await fs.promises.mkdir(runsRoot, { recursive: true });
     return runsRoot;
+  });
+
+  ipcMain.handle("planner:generatePlan", async (_event, requirement: string) => {
+    if (!requirement || !requirement.trim()) {
+      throw new Error("Requirement is empty");
+    }
+    return generatePlanFromRequirement(requirement);
   });
 
   ipcMain.handle(

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { TaskPlanSchema, type TaskPlan } from "../shared/protocol";
 
 type LogEntry = {
   id: string;
@@ -9,11 +10,6 @@ type LogEntry = {
 type DecisionState = {
   runId: string;
   files: string[];
-};
-
-type TaskPlan = {
-  plan_name: string;
-  steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }>;
 };
 
 const defaultPlan: TaskPlan = {
@@ -36,6 +32,8 @@ const App = () => {
   const [stepProgress, setStepProgress] = useState<{ current: number; total: number } | null>(null);
   const [planInput, setPlanInput] = useState(() => JSON.stringify(defaultPlan, null, 2));
   const [planError, setPlanError] = useState<string | null>(null);
+  const [generateError, setGenerateError] = useState<string | null>(null);
+  const [isGenerating, setIsGenerating] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
   const logRef = useRef<HTMLPreElement | null>(null);
@@ -60,29 +58,27 @@ const App = () => {
     }
   };
 
+  const formatZodIssues = (issues: { path: Array<string | number>; message: string }[]) =>
+    issues
+      .map((issue) => {
+        const path = issue.path.length ? issue.path.join(".") : "plan";
+        return `${path}: ${issue.message}`;
+      })
+      .join("; ");
+
   const parsePlan = (value: string): TaskPlan => {
-    const parsed = JSON.parse(value) as TaskPlan;
-    if (!parsed || typeof parsed.plan_name !== "string") {
-      throw new Error("plan_name must be a string");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Invalid JSON: ${message}`);
     }
-    if (!Array.isArray(parsed.steps)) {
-      throw new Error("steps must be an array");
+    const result = TaskPlanSchema.safeParse(parsed);
+    if (!result.success) {
+      throw new Error(formatZodIssues(result.error.issues));
     }
-    for (const step of parsed.steps) {
-      if (!step || typeof step !== "object") {
-        throw new Error("step must be an object");
-      }
-      if (step.type !== "note" && step.type !== "cmd") {
-        throw new Error("step.type must be note or cmd");
-      }
-      if (step.type === "note" && typeof (step as { message?: string }).message !== "string") {
-        throw new Error("note step requires message:string");
-      }
-      if (step.type === "cmd" && typeof (step as { command?: string }).command !== "string") {
-        throw new Error("cmd step requires command:string");
-      }
-    }
-    return parsed;
+    return result.data;
   };
 
   const runPlan = async () => {
@@ -145,6 +141,31 @@ const App = () => {
   const resetPlan = () => {
     setPlanInput(JSON.stringify(defaultPlan, null, 2));
     setPlanError(null);
+    setGenerateError(null);
+  };
+
+  const generatePlan = async () => {
+    if (!requirement.trim()) {
+      setGenerateError("Requirement is empty");
+      return;
+    }
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
+
+    setIsGenerating(true);
+    setGenerateError(null);
+    try {
+      const plan = await window.api.generatePlan(requirement);
+      setPlanInput(JSON.stringify(plan, null, 2));
+      setPlanError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setGenerateError(message);
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   const cancelRun = async () => {
@@ -312,7 +333,12 @@ const App = () => {
           onChange={(event) => setPlanInput(event.target.value)}
         />
         {planError && <p className="error">{planError}</p>}
+        {generateError && <p className="error">{generateError}</p>}
+        {isGenerating && <p className="muted">Generating plan...</p>}
         <div className="actions">
+          <button className="primary" onClick={generatePlan} disabled={isGenerating}>
+            Generate Plan
+          </button>
           <button className="secondary" onClick={resetPlan}>
             Use Default Plan
           </button>

@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { TaskPlan } from "../shared/protocol";
 
 contextBridge.exposeInMainWorld("appInfo", {
   version: process.versions.electron,
@@ -9,10 +10,11 @@ contextBridge.exposeInMainWorld("api", {
   selectWorkspace: async () => ipcRenderer.invoke("workspace:select"),
   runPlan: async (payload: {
     workspacePath: string;
-    plan: { plan_name: string; steps: Array<{ type: "cmd"; command: string } | { type: "note"; message: string }> };
+    plan: TaskPlan;
     requirement?: string;
   }) =>
     ipcRenderer.invoke("run:plan", payload),
+  generatePlan: async (requirement: string) => ipcRenderer.invoke("planner:generatePlan", requirement),
   cancelRun: async (runId: string) => ipcRenderer.invoke("run:cancel", runId),
   submitDecision: async (payload: { runId: string; result: "approved" | "rejected" }) =>
     ipcRenderer.invoke("run:decision", payload),
