@@ -738,6 +738,18 @@ const App = () => {
           >
             Toggle Clear Logs
           </button>
+          <button
+            className="secondary"
+            onClick={() =>
+              appendLog({
+                id: `${Date.now()}-hello-click`,
+                text: "Hello clicked\n",
+                source: "system"
+              })
+            }
+          >
+            Hello World
+          </button>
           {showClearLogs && (
             <button className="secondary" onClick={clearLogs} disabled={!logEntries.length}>
               Clear Logs
