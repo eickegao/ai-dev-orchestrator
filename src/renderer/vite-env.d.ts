@@ -14,6 +14,7 @@ declare global {
         workspacePath: string;
         plan: TaskPlan;
         requirement?: string;
+        allowDirtyVerifyOnly?: boolean;
       }) => Promise<string>;
       startAutobuild: (payload: {
         workspace: string;

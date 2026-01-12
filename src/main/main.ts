@@ -795,6 +795,24 @@ const diffFromBaseline = (baseline: string[], current: string[]) => {
   return current.filter((file) => !baselineSet.has(file));
 };
 
+const parseStatusPorcelain = (value: string) =>
+  value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const cleaned = line.slice(3).trim();
+      if (!cleaned) return "";
+      if (cleaned.includes("->")) {
+        const parts = cleaned.split("->");
+        return parts[parts.length - 1].trim();
+      }
+      return cleaned;
+    })
+    .filter(Boolean);
+
+const planHasExecutor = (plan: TaskPlan) => plan.steps.some((step) => step.type === "executor");
+
 const splitArgs = (command: string) => {
   const args: string[] = [];
   let current = "";
@@ -874,7 +892,7 @@ type RunPlanResult = {
 const runPlanInternal = async (
   sender: WebContents,
   payload: { workspacePath: string; plan: TaskPlan; requirement?: string },
-  options: { awaitDecision: boolean; runId?: string }
+  options: { awaitDecision: boolean; runId?: string; allowDirtyVerifyOnly?: boolean }
 ): Promise<RunPlanResult> => {
   if (activePlan) {
     throw new Error("Another run is already active");
@@ -920,6 +938,43 @@ const runPlanInternal = async (
     },
     steps: []
   };
+
+  const statusResult = await runCommandCapture(
+    "git",
+    ["status", "--porcelain"],
+    workspacePath
+  );
+  const dirtyFiles =
+    statusResult.code === 0 && statusResult.stdout
+      ? parseStatusPorcelain(statusResult.stdout)
+      : [];
+  const workspaceDirty = dirtyFiles.length > 0;
+  if (workspaceDirty) {
+    appendSystemLog(
+      sender,
+      runId,
+      outputStream,
+      `[guard] workspace dirty; ${dirtyFiles.length} file(s) changed\n`
+    );
+    runMeta.guard = {
+      workspace_dirty: true,
+      dirty_files: dirtyFiles
+    };
+    if (options.allowDirtyVerifyOnly && !planHasExecutor(plan)) {
+      runMeta.guard.allow_verify_only = true;
+      appendSystemLog(sender, runId, outputStream, "[guard] continue verify-only plan\n");
+      await writeRunMeta(runDir, runMeta);
+    } else {
+      runMeta.endTime = new Date().toISOString();
+      runMeta.exitCode = -1;
+      await writeRunMeta(runDir, runMeta);
+      outputStream.end();
+      activePlan = null;
+      const error = new Error("WorkspaceDirtyError: workspace has uncommitted changes");
+      error.name = "WorkspaceDirtyError";
+      throw error;
+    }
+  }
 
   let lastExitCode = 0;
   let blockedByPolicy = false;
@@ -1352,8 +1407,14 @@ const registerIpc = () => {
 
   ipcMain.handle(
     "run:plan",
-    async (event, payload: { workspacePath: string; plan: TaskPlan; requirement?: string }) => {
-      const result = await runPlanInternal(event.sender, payload, { awaitDecision: true });
+    async (
+      event,
+      payload: { workspacePath: string; plan: TaskPlan; requirement?: string; allowDirtyVerifyOnly?: boolean }
+    ) => {
+      const result = await runPlanInternal(event.sender, payload, {
+        awaitDecision: true,
+        allowDirtyVerifyOnly: Boolean(payload.allowDirtyVerifyOnly)
+      });
       return result.runId;
     });
 
@@ -1425,12 +1486,47 @@ const registerIpc = () => {
             run_id: runId
           });
 
-          const result = await runPlanInternal(
-            event.sender,
-            { workspacePath: payload.workspace, plan, requirement: payload.requirement },
-            { awaitDecision: false, runId }
-          );
-          iterationsRun += 1;
+          let result: RunPlanResult;
+          try {
+            result = await runPlanInternal(
+              event.sender,
+              { workspacePath: payload.workspace, plan, requirement: payload.requirement },
+              { awaitDecision: false, runId }
+            );
+            iterationsRun += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (message.startsWith("WorkspaceDirtyError")) {
+              stopReason = "workspace_dirty";
+              perIterationSummary.push({
+                iteration,
+                plan_name: plan.plan_name,
+                run_id: runId,
+                outcome: "workspace_dirty",
+                evaluation_brief: ""
+              });
+              event.sender.send("autobuild:status", {
+                iteration,
+                phase: "done",
+                message: "Workspace dirty; please commit or stash changes"
+              });
+              break;
+            }
+            stopReason = "failed";
+            perIterationSummary.push({
+              iteration,
+              plan_name: plan.plan_name,
+              run_id: runId,
+              outcome: "failed",
+              evaluation_brief: ""
+            });
+            event.sender.send("autobuild:status", {
+              iteration,
+              phase: "done",
+              message: `Run failed: ${message}`
+            });
+            break;
+          }
           const evaluation = result.lastExecutorEvaluation;
           const evaluationBrief = evaluation
             ? [

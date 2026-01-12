@@ -123,6 +123,13 @@ button:disabled {
   font-weight: 600;
 }
 
+.guard {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .input {
   width: 100%;
   padding: 12px;

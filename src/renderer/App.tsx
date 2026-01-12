@@ -52,6 +52,7 @@ const App = () => {
   } | null>(null);
   const [autobuildRuns, setAutobuildRuns] = useState<AutobuildRound[]>([]);
   const [autobuildStopReason, setAutobuildStopReason] = useState<string | null>(null);
+  const [dirtyGuardMessage, setDirtyGuardMessage] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
   const [showClearLogs, setShowClearLogs] = useState(true);
@@ -104,7 +105,7 @@ const App = () => {
     return result.data;
   };
 
-  const runPlan = async () => {
+  const runPlan = async (allowDirtyVerifyOnly = false) => {
     if (!workspacePath) {
       appendLog({
         id: `${Date.now()}-error`,
@@ -138,7 +139,13 @@ const App = () => {
       return;
     }
 
+    if (allowDirtyVerifyOnly && plan.steps.some((step) => step.type === "executor")) {
+      setDirtyGuardMessage("Verify-only mode does not allow executor steps.");
+      return;
+    }
+
     setIsRunning(true);
+    setDirtyGuardMessage(null);
     appendLog({
       id: `${Date.now()}-run`,
       text: `Running plan: ${plan.plan_name}\n`,
@@ -146,10 +153,20 @@ const App = () => {
     });
 
     try {
-      const runId = await window.api.runPlan({ workspacePath, plan, requirement });
+      const runId = await window.api.runPlan({
+        workspacePath,
+        plan,
+        requirement,
+        allowDirtyVerifyOnly
+      });
       setCurrentRunId(runId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("WorkspaceDirtyError")) {
+        setDirtyGuardMessage(
+          "Workspace has uncommitted changes. Commit or stash them, or continue with verify-only."
+        );
+      }
       appendLog({
         id: `${Date.now()}-run-error`,
         text: `${message}\n`,
@@ -539,6 +556,14 @@ const App = () => {
                 : generateError}
           </p>
         )}
+        {dirtyGuardMessage && (
+          <div className="guard">
+            <p className="error">{dirtyGuardMessage}</p>
+            <button className="secondary" onClick={() => runPlan(true)} disabled={isRunning}>
+              Continue (verify-only)
+            </button>
+          </div>
+        )}
         {isGenerating && <p className="muted">Generating plan...</p>}
         <div className="actions">
           <button className="primary" onClick={generatePlan} disabled={isGenerating}>
@@ -622,7 +647,7 @@ const App = () => {
             className="secondary"
             onClick={() => setShowClearLogs((prev) => !prev)}
           >
-            {showClearLogs ? "Hide Clear Logs" : "Show Clear Logs"}
+            Toggle Clear Logs
           </button>
           {showClearLogs && (
             <button className="secondary" onClick={clearLogs} disabled={!logEntries.length}>

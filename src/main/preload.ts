@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld("api", {
     workspacePath: string;
     plan: TaskPlan;
     requirement?: string;
+    allowDirtyVerifyOnly?: boolean;
   }) =>
     ipcRenderer.invoke("run:plan", payload),
   startAutobuild: async (payload: { workspace: string; requirement: string; maxIterations?: number }) =>
