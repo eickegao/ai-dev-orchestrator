@@ -886,7 +886,7 @@ type RunPlanResult = {
 const runPlanInternal = async (
   sender: WebContents,
   payload: { workspacePath: string; plan: TaskPlan; requirement?: string },
-  options: { awaitDecision: boolean }
+  options: { awaitDecision: boolean; runId?: string }
 ): Promise<RunPlanResult> => {
   if (activePlan) {
     throw new Error("Another run is already active");
@@ -905,7 +905,7 @@ const runPlanInternal = async (
     throw new Error("Not a git repository (no .git found)");
   }
 
-  const runId = String(Date.now());
+  const runId = options.runId ?? String(Date.now());
   const startTime = new Date().toISOString();
   const runDir = await ensureRunDir(runId);
   const outputPath = path.join(runDir, "output.log");
@@ -1387,6 +1387,13 @@ const registerIpc = () => {
       const maxIterations = payload.maxIterations ?? 2;
       let iterationsRun = 0;
       let stopReason = "max_iterations_reached";
+      const perIterationSummary: Array<{
+        iteration: number;
+        plan_name: string;
+        run_id: string;
+        outcome: string;
+        evaluation_brief: string;
+      }> = [];
 
       try {
         for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
@@ -1415,25 +1422,51 @@ const registerIpc = () => {
             break;
           }
 
-          event.sender.send("autobuild:plan", { iteration, plan });
+          event.sender.send("autobuild:plan", { iteration, plan, plan_name: plan.plan_name });
 
           if (autobuildCancelled) {
             stopReason = "cancelled";
             break;
           }
 
+          const runId = String(Date.now());
           event.sender.send("autobuild:status", {
             iteration,
             phase: "running",
-            message: "Running plan"
+            message: "Running plan",
+            run_id: runId
           });
 
           const result = await runPlanInternal(
             event.sender,
             { workspacePath: payload.workspace, plan, requirement: payload.requirement },
-            { awaitDecision: false }
+            { awaitDecision: false, runId }
           );
           iterationsRun += 1;
+          const evaluation = result.lastExecutorEvaluation;
+          const evaluationBrief = evaluation
+            ? [
+                `has_changes=${Boolean(evaluation.has_changes)}`,
+                `suspicious_no_change=${Boolean(evaluation.suspicious_no_change)}`,
+                `no_op=${Boolean(evaluation.no_op)}`,
+                `retried=${Boolean(evaluation.retried)}`,
+                `retry_has_changes=${Boolean(
+                  evaluation.retry_result
+                    ? (evaluation.retry_result as Record<string, unknown>).has_changes === true
+                    : false
+                )}`,
+                `changed_files=${Array.isArray(evaluation.changed_files)
+                  ? (evaluation.changed_files as string[]).slice(0, 5).join(", ") || "(none)"
+                  : "(none)"}`
+              ].join("; ")
+            : "";
+          perIterationSummary.push({
+            iteration,
+            plan_name: plan.plan_name,
+            run_id: result.runId,
+            outcome: "completed",
+            evaluation_brief: evaluationBrief
+          });
 
           if (result.decisionPending) {
             stopReason = "decision_pending";
@@ -1442,6 +1475,7 @@ const registerIpc = () => {
               phase: "done",
               message: "Decision pending, awaiting user input"
             });
+            perIterationSummary[perIterationSummary.length - 1].outcome = "decision_pending";
             break;
           }
 
@@ -1452,10 +1486,10 @@ const registerIpc = () => {
               phase: "done",
               message: "Cancelled"
             });
+            perIterationSummary[perIterationSummary.length - 1].outcome = "cancelled";
             break;
           }
 
-          const evaluation = result.lastExecutorEvaluation;
           const noOp = evaluation?.no_op === true;
           const suspiciousNoChange = evaluation?.suspicious_no_change === true;
           const retried = evaluation?.retried === true;
@@ -1470,6 +1504,7 @@ const registerIpc = () => {
               phase: "done",
               message: "No-op detected; please validate behavior"
             });
+            perIterationSummary[perIterationSummary.length - 1].outcome = "no_op";
             break;
           }
 
@@ -1480,11 +1515,13 @@ const registerIpc = () => {
               phase: "done",
               message: "Retry produced no changes; need more specific instructions"
             });
+            perIterationSummary[perIterationSummary.length - 1].outcome = "retry_no_change";
             break;
           }
 
           if (result.exitCode !== 0) {
             if (iteration < maxIterations) {
+              perIterationSummary[perIterationSummary.length - 1].outcome = "failed";
               continue;
             }
             stopReason = "failed";
@@ -1493,6 +1530,7 @@ const registerIpc = () => {
               phase: "done",
               message: "Run failed"
             });
+            perIterationSummary[perIterationSummary.length - 1].outcome = "failed";
             break;
           }
 
@@ -1503,6 +1541,7 @@ const registerIpc = () => {
               phase: "done",
               message: "Max iterations reached"
             });
+            perIterationSummary[perIterationSummary.length - 1].outcome = "max_iterations_reached";
             break;
           }
         }
@@ -1513,7 +1552,8 @@ const registerIpc = () => {
 
       event.sender.send("autobuild:done", {
         stop_reason: stopReason,
-        iterations_run: iterationsRun
+        iterations_run: iterationsRun,
+        per_iteration_summary: perIterationSummary
       });
       return true;
     }

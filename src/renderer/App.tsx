@@ -12,6 +12,16 @@ type DecisionState = {
   files: string[];
 };
 
+type AutobuildRound = {
+  iteration: number;
+  planName?: string;
+  planJson?: string;
+  runId?: string;
+  statuses: Array<{ phase: "planning" | "running" | "done"; message: string }>;
+  outcome?: string;
+  evaluationBrief?: string;
+};
+
 const defaultPlan: TaskPlan = {
   plan_name: "Default plan",
   steps: [
@@ -40,8 +50,11 @@ const App = () => {
     phase: "planning" | "running" | "done";
     message: string;
   } | null>(null);
+  const [autobuildRuns, setAutobuildRuns] = useState<AutobuildRound[]>([]);
+  const [autobuildStopReason, setAutobuildStopReason] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
+  const [showClearLogs, setShowClearLogs] = useState(true);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -154,6 +167,25 @@ const App = () => {
     setGenerateError(null);
   };
 
+  const upsertAutobuildRound = (iteration: number, update: Partial<AutobuildRound>) => {
+    setAutobuildRuns((prev) => {
+      const existing = prev.find((round) => round.iteration === iteration);
+      if (!existing) {
+        return [
+          ...prev,
+          {
+            iteration,
+            statuses: update.statuses ?? [],
+            ...update
+          } as AutobuildRound
+        ].sort((a, b) => a.iteration - b.iteration);
+      }
+      return prev.map((round) =>
+        round.iteration === iteration ? { ...round, ...update } : round
+      );
+    });
+  };
+
   const generatePlan = async () => {
     if (!requirement.trim()) {
       setGenerateError("Requirement is empty");
@@ -210,6 +242,8 @@ const App = () => {
 
     setIsAutobuilding(true);
     setAutobuildStatus(null);
+    setAutobuildRuns([]);
+    setAutobuildStopReason(null);
     try {
       await window.api.startAutobuild({
         workspace: workspacePath,
@@ -224,6 +258,24 @@ const App = () => {
         source: "system"
       });
       setIsAutobuilding(false);
+    }
+  };
+
+  const copyRunId = async (runId: string) => {
+    try {
+      await navigator.clipboard.writeText(runId);
+      appendLog({
+        id: `${Date.now()}-copy-runid`,
+        text: `Copied run_id: ${runId}\n`,
+        source: "system"
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendLog({
+        id: `${Date.now()}-copy-runid-failed`,
+        text: `Copy failed: ${message}\n`,
+        source: "stderr"
+      });
     }
   };
 
@@ -336,6 +388,29 @@ const App = () => {
 
     const unsubscribeAutobuildStatus = window.api.onAutobuildStatus((payload) => {
       setAutobuildStatus(payload);
+      setAutobuildRuns((prev) => {
+        const existing = prev.find((round) => round.iteration === payload.iteration);
+        const nextStatus = { phase: payload.phase, message: payload.message };
+        if (!existing) {
+          return [
+            ...prev,
+            {
+              iteration: payload.iteration,
+              runId: payload.run_id,
+              statuses: [nextStatus]
+            }
+          ].sort((a, b) => a.iteration - b.iteration);
+        }
+        return prev.map((round) =>
+          round.iteration === payload.iteration
+            ? {
+                ...round,
+                runId: payload.run_id ?? round.runId,
+                statuses: [...round.statuses, nextStatus]
+              }
+            : round
+        );
+      });
       appendLog({
         id: `${Date.now()}-autobuild-status`,
         text: `[autobuild] iter ${payload.iteration} ${payload.phase}: ${payload.message}\n`,
@@ -345,6 +420,10 @@ const App = () => {
 
     const unsubscribeAutobuildPlan = window.api.onAutobuildPlan((payload) => {
       setPlanInput(JSON.stringify(payload.plan, null, 2));
+      upsertAutobuildRound(payload.iteration, {
+        planName: payload.plan_name,
+        planJson: JSON.stringify(payload.plan, null, 2)
+      });
       appendLog({
         id: `${Date.now()}-autobuild-plan`,
         text: `[autobuild] received plan for iteration ${payload.iteration}\n`,
@@ -356,6 +435,15 @@ const App = () => {
       setAutobuildStatus((prev) =>
         prev ? { ...prev, phase: "done", message: `Stopped: ${payload.stop_reason}` } : prev
       );
+      setAutobuildStopReason(payload.stop_reason);
+      payload.per_iteration_summary.forEach((summary) => {
+        upsertAutobuildRound(summary.iteration, {
+          planName: summary.plan_name,
+          runId: summary.run_id,
+          outcome: summary.outcome,
+          evaluationBrief: summary.evaluation_brief
+        });
+      });
       appendLog({
         id: `${Date.now()}-autobuild-done`,
         text: `[autobuild] done after ${payload.iterations_run} iteration(s): ${payload.stop_reason}\n`,
@@ -473,6 +561,39 @@ const App = () => {
         />
       </section>
 
+      <section className="panel">
+        <h2>Auto Build Timeline</h2>
+        {autobuildStopReason && <p className="muted">Stopped: {autobuildStopReason}</p>}
+        {autobuildRuns.length === 0 && <p className="muted">No autobuild runs yet.</p>}
+        {autobuildRuns.map((round) => (
+          <details key={round.iteration}>
+            <summary>
+              Round {round.iteration} — {round.planName ?? "(planning)"} — {round.runId ?? "(no run id)"} —{" "}
+              {round.outcome ?? "in progress"}
+            </summary>
+            {round.evaluationBrief && <p className="muted">Eval: {round.evaluationBrief}</p>}
+            {round.planJson && (
+              <pre className="log">{round.planJson}</pre>
+            )}
+            <div className="actions">
+              {round.planJson && (
+                <button
+                  className="secondary"
+                  onClick={() => setPlanInput(round.planJson ?? "")}
+                >
+                  Use this plan
+                </button>
+              )}
+              {round.runId && (
+                <button className="secondary" onClick={() => copyRunId(round.runId ?? "")}>
+                  Copy run_id
+                </button>
+              )}
+            </div>
+          </details>
+        ))}
+      </section>
+
       {decision && (
         <section className="panel">
           <h2>Decision Required</h2>
@@ -497,9 +618,17 @@ const App = () => {
       <section className="panel">
         <h2>Logs</h2>
         <div className="actions">
-          <button className="secondary" onClick={clearLogs} disabled={!logEntries.length}>
-            Clear Logs
+          <button
+            className="secondary"
+            onClick={() => setShowClearLogs((prev) => !prev)}
+          >
+            {showClearLogs ? "Hide Clear Logs" : "Show Clear Logs"}
           </button>
+          {showClearLogs && (
+            <button className="secondary" onClick={clearLogs} disabled={!logEntries.length}>
+              Clear Logs
+            </button>
+          )}
         </div>
         <pre className="log" ref={logRef}>
           {logText || "No logs yet."}

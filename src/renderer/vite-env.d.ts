@@ -31,11 +31,28 @@ declare global {
       onRunCancelled: (callback: (payload: { runId: string }) => void) => () => void;
       onDecisionRequired: (callback: (payload: { runId: string; files: string[] }) => void) => () => void;
       onAutobuildStatus: (
-        callback: (payload: { iteration: number; phase: "planning" | "running" | "done"; message: string }) => void
+        callback: (payload: {
+          iteration: number;
+          phase: "planning" | "running" | "done";
+          message: string;
+          run_id?: string;
+        }) => void
       ) => () => void;
-      onAutobuildPlan: (callback: (payload: { iteration: number; plan: TaskPlan }) => void) => () => void;
+      onAutobuildPlan: (
+        callback: (payload: { iteration: number; plan: TaskPlan; plan_name: string }) => void
+      ) => () => void;
       onAutobuildDone: (
-        callback: (payload: { stop_reason: string; iterations_run: number }) => void
+        callback: (payload: {
+          stop_reason: string;
+          iterations_run: number;
+          per_iteration_summary: Array<{
+            iteration: number;
+            plan_name: string;
+            run_id: string;
+            outcome: string;
+            evaluation_brief: string;
+          }>;
+        }) => void
       ) => () => void;
     };
   }

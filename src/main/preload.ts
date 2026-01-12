@@ -58,30 +58,55 @@ contextBridge.exposeInMainWorld("api", {
     return () => ipcRenderer.removeListener("run:decision", listener);
   },
   onAutobuildStatus: (
-    callback: (payload: { iteration: number; phase: "planning" | "running" | "done"; message: string }) => void
+    callback: (payload: {
+      iteration: number;
+      phase: "planning" | "running" | "done";
+      message: string;
+      run_id?: string;
+    }) => void
   ) => {
     const listener = (
       _event: unknown,
-      payload: { iteration: number; phase: "planning" | "running" | "done"; message: string }
+      payload: { iteration: number; phase: "planning" | "running" | "done"; message: string; run_id?: string }
     ) => {
       callback(payload);
     };
     ipcRenderer.on("autobuild:status", listener);
     return () => ipcRenderer.removeListener("autobuild:status", listener);
   },
-  onAutobuildPlan: (callback: (payload: { iteration: number; plan: TaskPlan }) => void) => {
-    const listener = (_event: unknown, payload: { iteration: number; plan: TaskPlan }) => {
+  onAutobuildPlan: (callback: (payload: { iteration: number; plan: TaskPlan; plan_name: string }) => void) => {
+    const listener = (_event: unknown, payload: { iteration: number; plan: TaskPlan; plan_name: string }) => {
       callback(payload);
     };
     ipcRenderer.on("autobuild:plan", listener);
     return () => ipcRenderer.removeListener("autobuild:plan", listener);
   },
   onAutobuildDone: (
-    callback: (payload: { stop_reason: string; iterations_run: number }) => void
+    callback: (payload: {
+      stop_reason: string;
+      iterations_run: number;
+      per_iteration_summary: Array<{
+        iteration: number;
+        plan_name: string;
+        run_id: string;
+        outcome: string;
+        evaluation_brief: string;
+      }>;
+    }) => void
   ) => {
     const listener = (
       _event: unknown,
-      payload: { stop_reason: string; iterations_run: number }
+      payload: {
+        stop_reason: string;
+        iterations_run: number;
+        per_iteration_summary: Array<{
+          iteration: number;
+          plan_name: string;
+          run_id: string;
+          outcome: string;
+          evaluation_brief: string;
+        }>;
+      }
     ) => {
       callback(payload);
     };
