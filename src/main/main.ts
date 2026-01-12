@@ -44,11 +44,12 @@ const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrato
 const CAPABILITY_CARD = [
   "Orchestrator Capability Card",
   "- step types: cmd, note, executor",
-  '- executor: codex via `codex exec -C <workspace> --full-auto \"<instructions>\"` then `codex apply -C <workspace>`',
+  '- executor: codex via `codex exec --full-auto -C <workspace> \"<instructions>\"` (directly modifies workspace files)',
   "- supports evidence: git status --porcelain, git diff --stat, git diff --name-only",
   "- supports decision: dependency change approval prompt",
   "- supports cancel/timeout handling",
   "- evaluation fields: has_changes, changed_files, suspicious_no_change, no_op, retry_result (baseline diff aware)",
+  "- executor exit_code=0 with no changes is not a failure; it may be a no_op when precheck hits",
   "- policy: cmd allowlist is git-only; NEVER git add/commit/push"
 ].join("\n");
 
