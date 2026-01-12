@@ -1411,11 +1411,50 @@ const registerIpc = () => {
       event,
       payload: { workspacePath: string; plan: TaskPlan; requirement?: string; allowDirtyVerifyOnly?: boolean }
     ) => {
-      const result = await runPlanInternal(event.sender, payload, {
-        awaitDecision: true,
-        allowDirtyVerifyOnly: Boolean(payload.allowDirtyVerifyOnly)
-      });
-      return result.runId;
+      try {
+        const result = await runPlanInternal(event.sender, payload, {
+          awaitDecision: true,
+          allowDirtyVerifyOnly: Boolean(payload.allowDirtyVerifyOnly)
+        });
+        return { ok: true, result: result.runId };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.startsWith("WorkspaceDirtyError")) {
+          let dirtyFiles: string[] = [];
+          try {
+            const status = await runCommandCapture(
+              "git",
+              ["status", "--porcelain"],
+              payload.workspacePath
+            );
+            if (status.code === 0 && status.stdout) {
+              dirtyFiles = parseStatusPorcelain(status.stdout);
+            }
+          } catch {
+            // ignore status errors
+          }
+          return {
+            ok: false,
+            error: {
+              code: "WORKSPACE_DIRTY",
+              name: "WorkspaceDirtyError",
+              message: "Workspace has uncommitted changes",
+              details: {
+                dirty_files: dirtyFiles,
+                allow_verify_only_supported: true
+              }
+            }
+          };
+        }
+        return {
+          ok: false,
+          error: {
+            code: "UNKNOWN",
+            name: error instanceof Error ? error.name : "Error",
+            message
+          }
+        };
+      }
     });
 
   ipcMain.handle(

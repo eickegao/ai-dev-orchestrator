@@ -153,20 +153,31 @@ const App = () => {
     });
 
     try {
-      const runId = await window.api.runPlan({
+      const response = await window.api.runPlan({
         workspacePath,
         plan,
         requirement,
         allowDirtyVerifyOnly
       });
-      setCurrentRunId(runId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.startsWith("WorkspaceDirtyError")) {
+      if (response.ok) {
+        setCurrentRunId(response.result);
+        return;
+      }
+      if (response.error.code === "WORKSPACE_DIRTY") {
         setDirtyGuardMessage(
           "Workspace has uncommitted changes. Commit or stash them, or continue with verify-only."
         );
       }
+      appendLog({
+        id: `${Date.now()}-run-error`,
+        text: `${response.error.message}\n`,
+        source: "system"
+      });
+      setIsRunning(false);
+      setCurrentRunId(null);
+      setStepProgress(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       appendLog({
         id: `${Date.now()}-run-error`,
         text: `${message}\n`,
@@ -664,3 +675,4 @@ const App = () => {
 };
 
 export default App;
+// dirty test

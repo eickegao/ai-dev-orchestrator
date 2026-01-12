@@ -14,7 +14,21 @@ contextBridge.exposeInMainWorld("api", {
     requirement?: string;
     allowDirtyVerifyOnly?: boolean;
   }) =>
-    ipcRenderer.invoke("run:plan", payload),
+    ipcRenderer.invoke("run:plan", payload) as Promise<{
+      ok: true;
+      result: string;
+    } | {
+      ok: false;
+      error: {
+        code: string;
+        name: string;
+        message: string;
+        details?: {
+          dirty_files?: string[];
+          allow_verify_only_supported?: boolean;
+        };
+      };
+    }>,
   startAutobuild: async (payload: { workspace: string; requirement: string; maxIterations?: number }) =>
     ipcRenderer.invoke("autobuild:start", payload),
   cancelAutobuild: async () => ipcRenderer.invoke("autobuild:cancel"),
