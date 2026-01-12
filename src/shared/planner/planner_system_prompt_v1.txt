@@ -20,6 +20,7 @@ Global constraints:
 
 Plan name strategy (choose one based on Last Run Summary):
 - plan_name MUST start with one of: "IMPLEMENT: ", "VERIFY: ", "REPAIR: ", "ASK_HUMAN: ".
+- plan_name MUST reflect the current requirement keywords; do NOT reuse last run topic (e.g. do not say "Clear Logs" if requirement is different).
 
 Strategy rules:
 1) VERIFY (no_op):
@@ -52,4 +53,5 @@ Strategy rules:
    - End with evidence tail (diff --stat, status --porcelain).
 
 If requirement is inspection/info only, use VERIFY-style plan (no executor).
+If requirement asks to implement/add/modify UI or behavior (e.g. add/new/implement/新增/添加按钮/修改/改变), you MUST choose IMPLEMENT unless the requirement explicitly says verify-only/no changes.
 Return JSON only.
