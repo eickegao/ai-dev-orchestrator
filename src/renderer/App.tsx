@@ -53,6 +53,7 @@ const App = () => {
   const [autobuildRuns, setAutobuildRuns] = useState<AutobuildRound[]>([]);
   const [autobuildStopReason, setAutobuildStopReason] = useState<string | null>(null);
   const [dirtyGuardMessage, setDirtyGuardMessage] = useState<string | null>(null);
+  const [verifyOnlyRequested, setVerifyOnlyRequested] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
   const [showClearLogs, setShowClearLogs] = useState(true);
@@ -74,6 +75,7 @@ const App = () => {
     const selected = await window.api.selectWorkspace();
     if (selected) {
       setWorkspacePath(selected);
+      setVerifyOnlyRequested(false);
       appendLog({
         id: `${Date.now()}-workspace`,
         text: `Workspace set: ${selected}\n`,
@@ -105,7 +107,7 @@ const App = () => {
     return result.data;
   };
 
-  const runPlan = async (allowDirtyVerifyOnly = false) => {
+  const runPlan = async (allowDirtyVerifyOnly?: boolean) => {
     if (!workspacePath) {
       appendLog({
         id: `${Date.now()}-error`,
@@ -139,13 +141,16 @@ const App = () => {
       return;
     }
 
-    if (allowDirtyVerifyOnly && plan.steps.some((step) => step.type === "executor")) {
+    const verifyOnly = allowDirtyVerifyOnly ?? verifyOnlyRequested;
+    if (verifyOnly && plan.steps.some((step) => step.type === "executor")) {
+      setVerifyOnlyRequested(false);
       setDirtyGuardMessage("Verify-only mode does not allow executor steps.");
       return;
     }
 
     setIsRunning(true);
     setDirtyGuardMessage(null);
+    setVerifyOnlyRequested(false);
     appendLog({
       id: `${Date.now()}-run`,
       text: `Running plan: ${plan.plan_name}\n`,
@@ -157,7 +162,7 @@ const App = () => {
         workspacePath,
         plan,
         requirement,
-        allowDirtyVerifyOnly
+        allowDirtyVerifyOnly: verifyOnly
       });
       if (response.ok) {
         setCurrentRunId(response.result);
@@ -167,7 +172,9 @@ const App = () => {
         setDirtyGuardMessage(
           "Workspace has uncommitted changes. Commit or stash them, or continue with verify-only."
         );
+        return;
       }
+      setVerifyOnlyRequested(false);
       appendLog({
         id: `${Date.now()}-run-error`,
         text: `${response.error.message}\n`,
@@ -178,6 +185,7 @@ const App = () => {
       setStepProgress(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      setVerifyOnlyRequested(false);
       appendLog({
         id: `${Date.now()}-run-error`,
         text: `${message}\n`,
@@ -230,6 +238,7 @@ const App = () => {
       const plan = await window.api.generatePlan(requirement);
       setPlanInput(JSON.stringify(plan, null, 2));
       setPlanError(null);
+      setVerifyOnlyRequested(false);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setGenerateError(message);
@@ -272,6 +281,7 @@ const App = () => {
     setAutobuildStatus(null);
     setAutobuildRuns([]);
     setAutobuildStopReason(null);
+    setVerifyOnlyRequested(false);
     try {
       await window.api.startAutobuild({
         workspace: workspacePath,
@@ -570,7 +580,14 @@ const App = () => {
         {dirtyGuardMessage && (
           <div className="guard">
             <p className="error">{dirtyGuardMessage}</p>
-            <button className="secondary" onClick={() => runPlan(true)} disabled={isRunning}>
+            <button
+              className="secondary"
+              onClick={() => {
+                setVerifyOnlyRequested(true);
+                runPlan(true);
+              }}
+              disabled={isRunning}
+            >
               Continue (verify-only)
             </button>
           </div>
