@@ -993,6 +993,14 @@ const runPlanInternal = async (
       ? parseStatusPorcelain(statusResult.stdout)
       : [];
   const workspaceDirty = dirtyFiles.length > 0;
+  const verifyOnlyRequested = Boolean(options.allowDirtyVerifyOnly);
+  const effectiveVerifyOnly = workspaceDirty ? verifyOnlyRequested : false;
+  appendSystemLog(
+    sender,
+    runId,
+    outputStream,
+    `[verify-only] requested=${verifyOnlyRequested} effective=${effectiveVerifyOnly} dirty=${workspaceDirty}\n`
+  );
   if (workspaceDirty) {
     appendSystemLog(
       sender,
@@ -1004,7 +1012,7 @@ const runPlanInternal = async (
       workspace_dirty: true,
       dirty_files: dirtyFiles
     };
-    if (options.allowDirtyVerifyOnly && !planHasExecutor(plan)) {
+    if (effectiveVerifyOnly && !planHasExecutor(plan)) {
       runMeta.guard.allow_verify_only = true;
       appendSystemLog(sender, runId, outputStream, "[guard] continue verify-only plan\n");
       await writeRunMeta(runDir, runMeta);
