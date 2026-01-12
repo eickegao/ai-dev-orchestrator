@@ -108,12 +108,40 @@ const App = () => {
   };
 
   const runPlan = async (allowDirtyVerifyOnly?: boolean) => {
+    const verifyOnly = allowDirtyVerifyOnly ?? verifyOnlyRequested;
+    const logSnapshot = (planValid: boolean, hasExecutor: boolean) =>
+      `[ui] runPlan click workspaceSet=${Boolean(workspacePath)} planJsonValid=${planValid} hasExecutor=${hasExecutor} verifyOnlyRequested=${verifyOnly} isRunning=${isRunning} isAutobuilding=${isAutobuilding}\n`;
+
+    if (isRunning) {
+      appendLog({
+        id: `${Date.now()}-run-blocked`,
+        text: "[ui] runPlan blocked: already running\n",
+        source: "system"
+      });
+      console.debug("[ui] runPlan blocked: already running");
+      return;
+    }
+    if (isAutobuilding) {
+      appendLog({
+        id: `${Date.now()}-run-blocked`,
+        text: "[ui] runPlan blocked: autobuild active\n",
+        source: "system"
+      });
+      console.debug("[ui] runPlan blocked: autobuild active");
+      return;
+    }
     if (!workspacePath) {
       appendLog({
         id: `${Date.now()}-error`,
         text: "Workspace not set.\n",
         source: "system"
       });
+      appendLog({
+        id: `${Date.now()}-run-blocked`,
+        text: "[ui] runPlan blocked: workspace not set\n",
+        source: "system"
+      });
+      console.debug("[ui] runPlan blocked: workspace not set");
       return;
     }
 
@@ -123,6 +151,12 @@ const App = () => {
         text: "Decision required before running again.\n",
         source: "system"
       });
+      appendLog({
+        id: `${Date.now()}-run-blocked`,
+        text: "[ui] runPlan blocked: decision pending\n",
+        source: "system"
+      });
+      console.debug("[ui] runPlan blocked: decision pending");
       return;
     }
 
@@ -132,19 +166,45 @@ const App = () => {
     }
 
     let plan: TaskPlan;
+    let hasExecutor = false;
     try {
       plan = parsePlan(planInput);
       setPlanError(null);
+      hasExecutor = plan.steps.some((step) => step.type === "executor");
+      appendLog({
+        id: `${Date.now()}-run-click`,
+        text: logSnapshot(true, hasExecutor),
+        source: "system"
+      });
+      console.debug(
+        logSnapshot(true, hasExecutor).trim()
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setPlanError(message);
+      appendLog({
+        id: `${Date.now()}-run-click`,
+        text: logSnapshot(false, false),
+        source: "system"
+      });
+      appendLog({
+        id: `${Date.now()}-run-blocked`,
+        text: `[ui] runPlan blocked: plan JSON invalid: ${message}\n`,
+        source: "system"
+      });
+      console.debug(`[ui] runPlan blocked: plan JSON invalid: ${message}`);
       return;
     }
 
-    const verifyOnly = allowDirtyVerifyOnly ?? verifyOnlyRequested;
     if (verifyOnly && plan.steps.some((step) => step.type === "executor")) {
       setVerifyOnlyRequested(false);
       setDirtyGuardMessage("Verify-only mode does not allow executor steps.");
+      appendLog({
+        id: `${Date.now()}-run-blocked`,
+        text: "[ui] runPlan blocked: verify-only with executor\n",
+        source: "system"
+      });
+      console.debug("[ui] runPlan blocked: verify-only with executor");
       return;
     }
 
