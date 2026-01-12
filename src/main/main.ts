@@ -813,6 +813,50 @@ const parseStatusPorcelain = (value: string) =>
 
 const planHasExecutor = (plan: TaskPlan) => plan.steps.some((step) => step.type === "executor");
 
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: JsonValue }
+  | JsonValue[];
+
+const toSerializable = (value: unknown): JsonValue => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => toSerializable(item));
+  }
+  if (value instanceof Error) {
+    const errorRecord: { [key: string]: JsonValue } = {
+      name: value.name,
+      message: value.message
+    };
+    const anyError = value as { code?: unknown };
+    if (anyError.code) {
+      errorRecord.code = typeof anyError.code === "string" ? anyError.code : String(anyError.code);
+    }
+    return errorRecord;
+  }
+  if (value instanceof Map) {
+    return Array.from(value.entries()).map(([key, val]) => [String(key), toSerializable(val)]);
+  }
+  if (value instanceof Set) {
+    return Array.from(value.values()).map((val) => toSerializable(val));
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const result: { [key: string]: JsonValue } = {};
+    for (const [key, val] of Object.entries(obj)) {
+      result[key] = toSerializable(val);
+    }
+    return result;
+  }
+  return String(value);
+};
+
 const splitArgs = (command: string) => {
   const args: string[] = [];
   let current = "";
@@ -1490,27 +1534,30 @@ const registerIpc = () => {
             break;
           }
 
-          event.sender.send("autobuild:status", {
+          event.sender.send("autobuild:status", toSerializable({
             iteration,
             phase: "planning",
             message: "Generating plan"
-          });
+          }));
 
           let plan: TaskPlan;
           try {
             plan = await generatePlanFromRequirement(payload.requirement);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: `Planning failed: ${message}`
-            });
+            }));
             stopReason = "planning_failed";
             break;
           }
 
-          event.sender.send("autobuild:plan", { iteration, plan, plan_name: plan.plan_name });
+          event.sender.send(
+            "autobuild:plan",
+            toSerializable({ iteration, plan, plan_name: plan.plan_name })
+          );
 
           if (autobuildCancelled) {
             stopReason = "cancelled";
@@ -1518,12 +1565,12 @@ const registerIpc = () => {
           }
 
           const runId = String(Date.now());
-          event.sender.send("autobuild:status", {
+          event.sender.send("autobuild:status", toSerializable({
             iteration,
             phase: "running",
             message: "Running plan",
             run_id: runId
-          });
+          }));
 
           let result: RunPlanResult;
           try {
@@ -1544,11 +1591,11 @@ const registerIpc = () => {
                 outcome: "workspace_dirty",
                 evaluation_brief: ""
               });
-              event.sender.send("autobuild:status", {
+              event.sender.send("autobuild:status", toSerializable({
                 iteration,
                 phase: "done",
                 message: "Workspace dirty; please commit or stash changes"
-              });
+              }));
               break;
             }
             stopReason = "failed";
@@ -1559,11 +1606,11 @@ const registerIpc = () => {
               outcome: "failed",
               evaluation_brief: ""
             });
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: `Run failed: ${message}`
-            });
+            }));
             break;
           }
           const evaluation = result.lastExecutorEvaluation;
@@ -1593,22 +1640,22 @@ const registerIpc = () => {
 
           if (result.decisionPending) {
             stopReason = "decision_pending";
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: "Decision pending, awaiting user input"
-            });
+            }));
             perIterationSummary[perIterationSummary.length - 1].outcome = "decision_pending";
             break;
           }
 
           if (result.cancelled) {
             stopReason = "cancelled";
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: "Cancelled"
-            });
+            }));
             perIterationSummary[perIterationSummary.length - 1].outcome = "cancelled";
             break;
           }
@@ -1622,22 +1669,22 @@ const registerIpc = () => {
 
           if (noOp) {
             stopReason = "no_op";
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: "No-op detected; please validate behavior"
-            });
+            }));
             perIterationSummary[perIterationSummary.length - 1].outcome = "no_op";
             break;
           }
 
           if (suspiciousNoChange && retried && !retryHasChanges) {
             stopReason = "retry_no_change";
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: "Retry produced no changes; need more specific instructions"
-            });
+            }));
             perIterationSummary[perIterationSummary.length - 1].outcome = "retry_no_change";
             break;
           }
@@ -1648,22 +1695,22 @@ const registerIpc = () => {
               continue;
             }
             stopReason = "failed";
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: "Run failed"
-            });
+            }));
             perIterationSummary[perIterationSummary.length - 1].outcome = "failed";
             break;
           }
 
           if (iteration >= maxIterations) {
             stopReason = "max_iterations_reached";
-            event.sender.send("autobuild:status", {
+            event.sender.send("autobuild:status", toSerializable({
               iteration,
               phase: "done",
               message: "Max iterations reached"
-            });
+            }));
             perIterationSummary[perIterationSummary.length - 1].outcome = "max_iterations_reached";
             break;
           }
@@ -1673,11 +1720,11 @@ const registerIpc = () => {
         autobuildCancelled = false;
       }
 
-      event.sender.send("autobuild:done", {
+      event.sender.send("autobuild:done", toSerializable({
         stop_reason: stopReason,
         iterations_run: iterationsRun,
         per_iteration_summary: perIterationSummary
-      });
+      }));
       return true;
     }
   );
