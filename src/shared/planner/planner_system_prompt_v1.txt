@@ -10,36 +10,46 @@ The JSON MUST conform to this schema:
   ]
 }
 
-Constraints:
+Global constraints:
 - Max 8 steps; include at least 1 note step.
-- steps[0] MUST be a cmd step with command exactly: "git status -sb".
-- Commands run in a local git workspace.
-- Assume command allowlist includes only: git. Do not output non-git commands.
 - cmd.command must be a single git command (starts with "git ") and MUST NOT include shell operators:
   "||", "&&", "|", ">", "<", ";", "$()", or backticks.
-- NEVER include: git add, git commit, git push.
-- The last two steps MUST be these cmd steps in order:
-  1) "git diff --stat"
-  2) "git status --porcelain"
-- If the requirement implies code changes, prefer an executor step as steps[1] with:
-  - type: "executor", tool: "codex"
-  - instructions must include:
-    - specific file path(s) to edit (prefer: src/renderer/App.tsx for UI work)
-    - concrete implementation actions
-    - "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install"
-    - limit scope (e.g. "ONLY edit src/renderer/App.tsx")
-  - instructions must be concise (<= 600 chars)
-- If the requirement mentions adding UI elements/buttons/features (e.g. Clear Logs), insert a git-only precheck before the executor:
-  - steps[1] must be cmd: git grep -n "Clear Logs" -- src/renderer/App.tsx || true
-  - steps[2] must be the executor step (codex)
-  - executor instructions must say:
-    - if precheck hit, do not add duplicates; only verify behavior or minimal fix
-    - otherwise add the button and onClick to clear logs
-    - ONLY edit src/renderer/App.tsx
-    - no dependency changes
-- When an executor step is present, include a note step after the executor and before evidence cmds with concrete acceptance criteria:
-  - at least 3 observable items (e.g. button renders, click clears logs, new logs still append, no dependency changes)
-- If the requirement is only inspection/info (no code changes), do not include executor; use note/cmd only.
-- If uncertain, still return a minimal valid plan with a note and the required evidence commands.
+- Only allow git commands; NEVER include: git add, git commit, git push, git checkout, git branch.
+- Commands run in a local git workspace.
+- Evidence tail (when present): last two steps MUST be cmd "git diff --stat" then cmd "git status --porcelain".
 
+Plan name strategy (choose one based on Last Run Summary):
+- plan_name MUST start with one of: "IMPLEMENT: ", "VERIFY: ", "REPAIR: ", "ASK_HUMAN: ".
+
+Strategy rules:
+1) VERIFY (no_op):
+   - Trigger if Last Run Summary includes no_op=true or autobuild stop reason is no_op.
+   - Do NOT include executor.
+   - Use only note + git cmd steps.
+   - Include at least 2 git verification commands (examples: git grep -n "...", git diff --stat, git status --porcelain).
+   - Note must list >=3 observable acceptance items for a human.
+2) REPAIR (failed):
+   - Trigger if Last Run Summary indicates exit_code!=0 or autobuild stop reason is failed.
+   - If failure is cmd policy/parse (forbidden ops / parse error): write a note explaining the reason and provide a corrected git-only plan; no executor.
+   - If failure is executor (codex exec failed): include an executor step with specific file path(s) and actions to fix.
+   - Must end with evidence tail (diff --stat, status --porcelain).
+3) ASK_HUMAN (suspicious_no_change without no_op):
+   - Trigger if Last Run Summary shows suspicious_no_change=true and no_op=false.
+   - Do NOT include executor.
+   - Include a note with 1-3 clear questions for the user (scope, UI wording, file permissions, expected behavior).
+   - Optional: 1-2 git-only cmds to gather context (e.g. git grep).
+4) IMPLEMENT (default for code changes):
+   - steps[0] MUST be cmd "git status -sb".
+   - Optional precheck: a git grep cmd (no shell operators; exit 1 is no matches).
+   - Must include an executor step (tool=codex).
+   - Executor instructions must:
+     * specify concrete file path(s) (prefer src/renderer/App.tsx),
+     * state clear implementation actions,
+     * include: "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install",
+     * include: "ONLY edit <file>",
+     * be <= 600 chars.
+   - After executor, insert a note with >=3 observable acceptance criteria.
+   - End with evidence tail (diff --stat, status --porcelain).
+
+If requirement is inspection/info only, use VERIFY-style plan (no executor).
 Return JSON only.
