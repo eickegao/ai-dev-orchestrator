@@ -53,7 +53,7 @@ const App = () => {
   const [autobuildRuns, setAutobuildRuns] = useState<AutobuildRound[]>([]);
   const [autobuildStopReason, setAutobuildStopReason] = useState<string | null>(null);
   const [dirtyGuardMessage, setDirtyGuardMessage] = useState<string | null>(null);
-  const [verifyOnlyRequested, setVerifyOnlyRequested] = useState(false);
+  const [verifyOnlyRequested, setVerifyOnlyRequested] = useState<boolean>(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
   const [showClearLogs, setShowClearLogs] = useState(true);
@@ -107,10 +107,11 @@ const App = () => {
     return result.data;
   };
 
-  const runPlan = async (allowDirtyVerifyOnly?: boolean) => {
-    const verifyOnly = allowDirtyVerifyOnly ?? verifyOnlyRequested;
+  const runPlan = async (allowDirtyVerifyOnly = false) => {
+    const verifyOnly = allowDirtyVerifyOnly === true;
+    const verifyOnlyFlag = verifyOnlyRequested === true;
     const logSnapshot = (planValid: boolean, hasExecutor: boolean) =>
-      `[ui] runPlan click workspaceSet=${Boolean(workspacePath)} planJsonValid=${planValid} hasExecutor=${hasExecutor} verifyOnlyRequested=${verifyOnly} isRunning=${isRunning} isAutobuilding=${isAutobuilding}\n`;
+      `[ui] runPlan click workspaceSet=${Boolean(workspacePath)} planJsonValid=${planValid} hasExecutor=${hasExecutor} verifyOnlyRequested=${verifyOnlyFlag} isRunning=${isRunning} isAutobuilding=${isAutobuilding}\n`;
 
     if (isRunning) {
       appendLog({
@@ -197,7 +198,6 @@ const App = () => {
     }
 
     if (verifyOnly && plan.steps.some((step) => step.type === "executor")) {
-      setVerifyOnlyRequested(false);
       setDirtyGuardMessage("Verify-only mode does not allow executor steps.");
       appendLog({
         id: `${Date.now()}-run-blocked`,
@@ -210,7 +210,6 @@ const App = () => {
 
     setIsRunning(true);
     setDirtyGuardMessage(null);
-    setVerifyOnlyRequested(false);
     appendLog({
       id: `${Date.now()}-run`,
       text: `Running plan: ${plan.plan_name}\n`,
@@ -234,7 +233,6 @@ const App = () => {
         );
         return;
       }
-      setVerifyOnlyRequested(false);
       appendLog({
         id: `${Date.now()}-run-error`,
         text: `${response.error.message}\n`,
@@ -245,7 +243,6 @@ const App = () => {
       setStepProgress(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setVerifyOnlyRequested(false);
       appendLog({
         id: `${Date.now()}-run-error`,
         text: `${message}\n`,
@@ -642,9 +639,13 @@ const App = () => {
             <p className="error">{dirtyGuardMessage}</p>
             <button
               className="secondary"
-              onClick={() => {
+              onClick={async () => {
                 setVerifyOnlyRequested(true);
-                runPlan(true);
+                try {
+                  await runPlan(true);
+                } finally {
+                  setVerifyOnlyRequested(false);
+                }
               }}
               disabled={isRunning}
             >
