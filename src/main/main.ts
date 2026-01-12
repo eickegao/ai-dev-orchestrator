@@ -778,20 +778,7 @@ const runExecutorStreaming = async (
     sender,
     outputStream
   );
-  if (execResult.exitCode !== 0 || execResult.cancelled || execResult.timedOut || execResult.error) {
-    return execResult;
-  }
-
-  const applyArgs = ["apply", "-C", workspacePath];
-  const applyResult = await runExecutorCommand(
-    tool,
-    applyArgs,
-    workspacePath,
-    runId,
-    sender,
-    outputStream
-  );
-  return applyResult;
+  return execResult;
 };
 
 const buildRetryInstructions = () =>
