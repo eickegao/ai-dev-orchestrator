@@ -195,6 +195,9 @@ const hasForbiddenShellOperators = (command: string) => {
   return forbidden.some((op) => command.includes(op));
 };
 
+const planHasForbiddenCmdOps = (plan: TaskPlan) =>
+  plan.steps.some((step) => step.type === "cmd" && hasForbiddenShellOperators(step.command));
+
 const PROMPT_RELATIVE_PATH = path.join("shared", "planner", "planner_system_prompt_v1.txt");
 const DIST_RELATIVE_PATH = path.join("dist", PROMPT_RELATIVE_PATH);
 const SRC_RELATIVE_PATH = path.join("src", PROMPT_RELATIVE_PATH);
@@ -421,81 +424,100 @@ const generatePlanFromRequirement = async (requirement: string): Promise<TaskPla
   console.log(`[planner] capabilityCardLength: ${CAPABILITY_CARD.length}`);
 
   const systemPrompt = await loadPlannerSystemPrompt();
-  const userPrompt = [
+  const baseUserPrompt = [
     CAPABILITY_CARD,
     summary,
     "Requirement:",
     requirement.trim()
   ].join("\n");
-  const response = await fetch(OPENAI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ]
-    })
-  });
 
-  if (!response.ok) {
-    let message = `OpenAI API error (${response.status})`;
-    try {
-      const data = await response.json();
-      if (data?.error?.message) {
-        message = data.error.message;
+  const retryHint =
+    "Reminder: cmd runner uses spawn(shell=false); do NOT output any shell operators. " +
+    "For git grep, exit 1 (no matches) is treated as success; do NOT append '|| true'.";
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const userPrompt = attempt === 0 ? baseUserPrompt : `${baseUserPrompt}\n${retryHint}`;
+    const response = await fetch(OPENAI_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      let message = `OpenAI API error (${response.status})`;
+      try {
+        const data = await response.json();
+        if (data?.error?.message) {
+          message = data.error.message;
+        }
+      } catch {
+        // keep fallback message
       }
-    } catch {
-      // keep fallback message
+      throw new Error(message);
     }
-    throw new Error(message);
-  }
 
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: unknown } }>;
-  };
-  const rawText = normalizePlannerContent(data?.choices?.[0]?.message?.content);
-  if (!rawText) {
-    throw new Error("OpenAI response missing content");
-  }
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: unknown } }>;
+    };
+    const rawText = normalizePlannerContent(data?.choices?.[0]?.message?.content);
+    if (!rawText) {
+      throw new Error("OpenAI response missing content");
+    }
 
-  const rawPreview = previewText(rawText);
-  console.log(`[planner] raw output length: ${rawText.length}`);
-  console.log(`[planner] raw output preview: ${rawPreview}`);
+    const rawPreview = previewText(rawText);
+    console.log(`[planner] raw output length: ${rawText.length}`);
+    console.log(`[planner] raw output preview: ${rawPreview}`);
 
-  let parsedJson: unknown;
-  let extractedJsonText = "";
-  try {
-    extractedJsonText = extractJsonFromText(rawText);
-    parsedJson = JSON.parse(extractedJsonText);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Planner JSON parse error: ${message}; rawPreview="${rawPreview}"`
-    );
-  }
-
-  try {
-    const plan = TaskPlanSchema.parse(parsedJson);
-    validateGeneratedPlan(plan);
-    return plan;
-  } catch (error) {
-    const extractedPreview = previewText(extractedJsonText);
-    const parsedPreview = previewText(
-      JSON.stringify(parsedJson ?? null)
-    );
-    if (error instanceof ZodError) {
+    let parsedJson: unknown;
+    let extractedJsonText = "";
+    try {
+      extractedJsonText = extractJsonFromText(rawText);
+      parsedJson = JSON.parse(extractedJsonText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       throw new Error(
-        `Plan schema validation failed: ${formatZodError(error)}; rawPreview="${rawPreview}"; extractedPreview="${extractedPreview}"; parsedPreview="${parsedPreview}"`
+        `Planner JSON parse error: ${message}; rawPreview="${rawPreview}"`
       );
     }
-    throw error;
+
+    try {
+      const plan = TaskPlanSchema.parse(parsedJson);
+      validateGeneratedPlan(plan);
+      if (planHasForbiddenCmdOps(plan)) {
+        if (attempt === 0) {
+          console.log("[planner] forbidden shell operators detected; retrying");
+          continue;
+        }
+        throw new Error(
+          "Planner output includes forbidden shell operators in cmd steps. Remove shell operators manually and retry."
+        );
+      }
+      return plan;
+    } catch (error) {
+      const extractedPreview = previewText(extractedJsonText);
+      const parsedPreview = previewText(
+        JSON.stringify(parsedJson ?? null)
+      );
+      if (error instanceof ZodError) {
+        throw new Error(
+          `Plan schema validation failed: ${formatZodError(error)}; rawPreview="${rawPreview}"; extractedPreview="${extractedPreview}"; parsedPreview="${parsedPreview}"`
+        );
+      }
+      throw error;
+    }
   }
+
+  throw new Error("Planner failed to generate a valid plan");
 };
 
 const runCommandCapture = (
