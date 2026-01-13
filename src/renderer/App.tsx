@@ -57,6 +57,7 @@ const App = () => {
   const [apiError, setApiError] = useState<string | null>(null);
   const [requirement, setRequirement] = useState("");
   const [showClearLogs, setShowClearLogs] = useState(true);
+  const [showHelloWorld, setShowHelloWorld] = useState(true);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -740,6 +741,20 @@ const App = () => {
           </button>
           <button
             className="secondary"
+            onClick={() => {
+              appendLog({
+                id: `${Date.now()}-click-me`,
+                text: "+1\n",
+                source: "system"
+              });
+              setShowHelloWorld((prev) => !prev);
+            }}
+          >
+            click me
+          </button>
+          {showHelloWorld && (
+          <button
+            className="secondary"
             onClick={() =>
               appendLog({
                 id: `${Date.now()}-hello-click`,
@@ -750,6 +765,7 @@ const App = () => {
           >
             Hello World
           </button>
+          )}
           {showClearLogs && (
             <button className="secondary" onClick={clearLogs} disabled={!logEntries.length}>
               Clear Logs
