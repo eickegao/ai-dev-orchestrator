@@ -5,7 +5,7 @@
   "main": "dist/main/main.js",
   "type": "commonjs",
   "scripts": {
-    "dev": "concurrently -k \"tsc -p tsconfig.json --watch --preserveWatchOutput\" \"vite\" \"wait-on dist/main/main.js dist/main/preload.js tcp:5173 && electron .\"",
+    "dev": "concurrently -k \"tsc -p tsconfig.json --watch --preserveWatchOutput\" \"vite\" \"wait-on dist/main/main.js dist/main/preload.js tcp:58433 && electron .\"",
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview"
   },

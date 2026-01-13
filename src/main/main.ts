@@ -20,7 +20,7 @@ const createWindow = () => {
     const indexPath = path.join(__dirname, "../renderer/index.html");
     window.loadURL(pathToFileURL(indexPath).toString());
   } else {
-    window.loadURL("http://localhost:5173");
+    window.loadURL("http://127.0.0.1:58433");
     window.webContents.openDevTools({ mode: "detach" });
   }
 };
@@ -451,7 +451,8 @@ const runExecutorCommand = (
       if (activeRun?.runId === runId) {
         clearTimeout(activeRun.timeoutId);
       }
-      const message = error.code === "ENOENT" ? `${tool} not found in PATH` : error.message;
+      const err = error as NodeJS.ErrnoException;
+      const message = err.code === "ENOENT" ? `${tool} not found in PATH` : err.message;
       appendSystemLog(sender, runId, outputStream, `Executor error: ${message}\n`);
       const cancelled = activeRun?.cancelled ?? false;
       const timedOut = activeRun?.timedOut ?? false;
