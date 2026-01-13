@@ -3,8 +3,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { ZodError } from "zod";
-import { TaskPlanSchema, type TaskPlan } from "../shared/protocol";
 
 const createWindow = () => {
   const preloadPath = path.join(__dirname, "preload.js");
@@ -30,150 +28,13 @@ const createWindow = () => {
 const RUN_TIMEOUT_MS = 30_000;
 const ALLOWED_COMMAND_PREFIXES = ["git"];
 const ALLOWED_EXECUTOR_TOOLS = new Set(["codex"]);
-const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL = "gpt-4o-mini";
-const DEPENDENCY_FILES = new Set([
-  "package.json",
-  "package-lock.json",
-  "yarn.lock",
-  "pnpm-lock.yaml"
-]);
 
 const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrator", "data", "runs");
-
-const CAPABILITY_CARD = [
-  "Orchestrator Capability Card",
-  "- step types: cmd, note, executor",
-  '- executor: codex via `codex exec --full-auto -C <workspace> \"<instructions>\"` (directly modifies workspace files)',
-  "- supports evidence: git status --porcelain, git diff --stat, git diff --name-only",
-  "- supports decision: dependency change approval prompt",
-  "- supports cancel/timeout handling",
-  "- evaluation fields: has_changes, changed_files, suspicious_no_change, no_op, retry_result (baseline diff aware)",
-  "- executor exit_code=0 with no changes is not a failure; it may be a no_op when precheck hits",
-  "- policy: cmd allowlist is git-only; NEVER git add/commit/push"
-].join("\n");
 
 const ensureRunDir = async (runId: string) => {
   const baseDir = path.join(getRunsRoot(), runId);
   await fs.promises.mkdir(baseDir, { recursive: true });
   return baseDir;
-};
-
-const getLatestRunDir = async () => {
-  const runsRoot = getRunsRoot();
-  let entries: fs.Dirent[];
-  try {
-    entries = await fs.promises.readdir(runsRoot, { withFileTypes: true });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { runDir: null, reason: `runs root unavailable: ${message}` };
-  }
-
-  let latestDir: string | null = null;
-  let latestMtime = 0;
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const fullPath = path.join(runsRoot, entry.name);
-    try {
-      const stat = await fs.promises.stat(fullPath);
-      if (stat.mtimeMs > latestMtime) {
-        latestMtime = stat.mtimeMs;
-        latestDir = fullPath;
-      }
-    } catch {
-      // ignore stat errors for unrelated entries
-    }
-  }
-
-  if (!latestDir) {
-    return { runDir: null, reason: "no runs found" };
-  }
-
-  return { runDir: latestDir, reason: "" };
-};
-
-const buildLastRunSummary = async () => {
-  const { runDir, reason } = await getLatestRunDir();
-  if (!runDir) {
-    return {
-      summary: `(no last run summary available: ${reason})`,
-      found: false
-    };
-  }
-
-  const runPath = path.join(runDir, "run.json");
-  try {
-    const raw = await fs.promises.readFile(runPath, "utf-8");
-    const run = JSON.parse(raw) as Record<string, unknown>;
-    const steps = Array.isArray(run.steps) ? (run.steps as Record<string, unknown>[]) : [];
-
-    let lastExecutorEval: Record<string, unknown> | null = null;
-    for (let i = steps.length - 1; i >= 0; i -= 1) {
-      const step = steps[i];
-      if (step?.type === "executor") {
-        const evaluation = (step.evaluation ?? null) as Record<string, unknown> | null;
-        if (evaluation) lastExecutorEval = evaluation;
-        break;
-      }
-    }
-
-    const summary: Record<string, string> = {
-      run_id: String(run.run_id ?? ""),
-      started_at: String(run.startTime ?? ""),
-      ended_at: String(run.endTime ?? ""),
-      workspace: String(run.workspacePath ?? ""),
-      plan_name: String((run.plan as Record<string, unknown> | undefined)?.name ?? "")
-    };
-
-    const evaluationLines: string[] = [];
-    if (lastExecutorEval) {
-      const changedFiles = Array.isArray(lastExecutorEval.changed_files)
-        ? (lastExecutorEval.changed_files as string[]).slice(0, 10)
-        : [];
-      const retryResult = (lastExecutorEval.retry_result ?? null) as Record<string, unknown> | null;
-      evaluationLines.push(`has_changes: ${Boolean(lastExecutorEval.has_changes)}`);
-      evaluationLines.push(`changed_files: ${changedFiles.join(", ") || "(none)"}`);
-      evaluationLines.push(`suspicious_no_change: ${Boolean(lastExecutorEval.suspicious_no_change)}`);
-      evaluationLines.push(`no_op: ${Boolean(lastExecutorEval.no_op)}`);
-      evaluationLines.push(`retried: ${Boolean(lastExecutorEval.retried)}`);
-      if (retryResult) {
-        evaluationLines.push(`retry_has_changes: ${Boolean(retryResult.has_changes)}`);
-      }
-      const baselineCount = Array.isArray(lastExecutorEval.baseline_files)
-        ? lastExecutorEval.baseline_files.length
-        : 0;
-      const currentCount = Array.isArray(lastExecutorEval.current_files)
-        ? lastExecutorEval.current_files.length
-        : 0;
-      evaluationLines.push(`baseline_files_count: ${baselineCount}`);
-      evaluationLines.push(`current_files_count: ${currentCount}`);
-    }
-
-    const decision = run.decision as Record<string, unknown> | undefined;
-    const decisionLine = decision ? `decision: ${String(decision.result ?? "")}` : "";
-
-    const summaryText = [
-      "Last Run Summary",
-      `run_id: ${summary.run_id}`,
-      `started_at: ${summary.started_at}`,
-      `ended_at: ${summary.ended_at}`,
-      `workspace: ${summary.workspace}`,
-      `plan_name: ${summary.plan_name}`,
-      evaluationLines.length ? `executor_evaluation: ${evaluationLines.join("; ")}` : "",
-      decisionLine
-    ]
-      .filter(Boolean)
-      .join("\n")
-      .slice(0, 1200);
-
-    return { summary: summaryText, found: true };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      summary: `(no last run summary available: ${message})`,
-      found: false
-    };
-  }
 };
 
 const isGitRepo = async (workspacePath: string) => {
@@ -196,44 +57,14 @@ const hasForbiddenShellOperators = (command: string) => {
   return forbidden.some((op) => command.includes(op));
 };
 
-const planHasForbiddenCmdOps = (plan: TaskPlan) =>
-  plan.steps.some((step) => step.type === "cmd" && hasForbiddenShellOperators(step.command));
+type PlanStep =
+  | { type: "cmd"; command: string }
+  | { type: "note"; message: string }
+  | { type: "executor"; tool: "codex"; instructions: string };
 
-const PROMPT_RELATIVE_PATH = path.join("shared", "planner", "planner_system_prompt_v1.txt");
-const DIST_RELATIVE_PATH = path.join("dist", PROMPT_RELATIVE_PATH);
-const SRC_RELATIVE_PATH = path.join("src", PROMPT_RELATIVE_PATH);
-
-const loadPlannerSystemPrompt = async () => {
-  const basePaths = app.isPackaged ? [process.resourcesPath, __dirname] : [process.cwd()];
-  const attemptedPaths: string[] = [];
-
-  for (const base of basePaths) {
-    const distPath = path.join(base, DIST_RELATIVE_PATH);
-    attemptedPaths.push(distPath);
-    try {
-      const prompt = await fs.promises.readFile(distPath, "utf-8");
-      console.log(`[planner] system prompt loaded from: ${distPath}`);
-      console.log(`[planner] system prompt length: ${prompt.length}`);
-      return prompt;
-    } catch {
-      // try fallback
-    }
-
-    const srcPath = path.join(base, SRC_RELATIVE_PATH);
-    attemptedPaths.push(srcPath);
-    try {
-      const prompt = await fs.promises.readFile(srcPath, "utf-8");
-      console.log(`[planner] system prompt loaded from: ${srcPath}`);
-      console.log(`[planner] system prompt length: ${prompt.length}`);
-      return prompt;
-    } catch {
-      // try next base
-    }
-  }
-
-  throw new Error(
-    `Planner system prompt not found. Tried: ${attemptedPaths.join(", ")}`
-  );
+type TaskPlan = {
+  plan_name: string;
+  steps: PlanStep[];
 };
 
 type ActiveRun = {
@@ -259,17 +90,8 @@ type ActivePlan = {
   cancelled: boolean;
 };
 
-type DecisionWaiter = {
-  runDir: string;
-  files: string[];
-  resolve: (result: "approved" | "rejected") => void;
-};
-
 let activeRun: ActiveRun | null = null;
 let activePlan: ActivePlan | null = null;
-let autobuildActive = false;
-let autobuildCancelled = false;
-const pendingDecisions = new Map<string, DecisionWaiter>();
 
 const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
   await fs.promises.writeFile(
@@ -277,17 +99,6 @@ const writeRunMeta = async (runDir: string, meta: Record<string, unknown>) => {
     JSON.stringify(meta, null, 2),
     "utf-8"
   );
-};
-
-const mergeDecisionFromDisk = async (runDir: string, meta: Record<string, unknown>) => {
-  try {
-    const existing = JSON.parse(await fs.promises.readFile(path.join(runDir, "run.json"), "utf-8"));
-    if (existing.decision) {
-      meta.decision = existing.decision;
-    }
-  } catch {
-    // Ignore missing/invalid run.json while plan is still running.
-  }
 };
 
 const appendSystemLog = (sender: WebContents, runId: string, outputStream: fs.WriteStream, text: string) => {
@@ -321,204 +132,123 @@ const terminateProcess = (child: ChildProcessWithoutNullStreams, killGroup = fal
   child.once("exit", () => clearTimeout(killTimer));
 };
 
-const parseNameOnly = (value: string) =>
-  value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+const splitArgs = (command: string) => {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escape = false;
 
-const matchDependencyFiles = (files: string[]) => {
-  const matched = new Set<string>();
-  for (const file of files) {
-    for (const depFile of DEPENDENCY_FILES) {
-      if (file === depFile || file.endsWith(`/${depFile}`)) {
-        matched.add(file);
-      }
-    }
-  }
-  return Array.from(matched);
-};
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i];
 
-const formatZodError = (error: ZodError) =>
-  error.issues
-    .map((issue) => {
-      const path = issue.path.length ? issue.path.join(".") : "plan";
-      return `${path}: ${issue.message}`;
-    })
-    .join("; ");
-
-const previewText = (value: string, limit = 200) => value.slice(0, limit);
-
-const extractJsonFromText = (rawText: string) => {
-  const trimmed = rawText.trim();
-  if (!trimmed) {
-    throw new Error("Planner output is empty");
-  }
-
-  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (fenceMatch?.[1]) {
-    return fenceMatch[1].trim();
-  }
-
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error("Planner output does not contain a JSON object");
-  }
-
-  return trimmed.slice(firstBrace, lastBrace + 1);
-};
-
-const normalizePlannerContent = (content: unknown): string => {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item && typeof item === "object" && "text" in item && typeof item.text === "string") {
-          return item.text;
-        }
-        return "";
-      })
-      .join("");
-  }
-  return "";
-};
-
-const validateGeneratedPlan = (plan: TaskPlan) => {
-  const issues: string[] = [];
-
-  if (plan.steps.length > 8) {
-    issues.push("plan must have at most 8 steps");
-  }
-
-  if (!plan.steps.some((step) => step.type === "note")) {
-    issues.push("plan must include at least 1 note step");
-  }
-
-  for (const step of plan.steps) {
-    if (step.type !== "cmd") continue;
-    const command = step.command.trim();
-    if (!command) {
-      issues.push("cmd.command cannot be empty");
+    if (escape) {
+      current += char;
+      escape = false;
       continue;
     }
-    if (!isCommandAllowed(command)) {
-      issues.push(`cmd.command not allowed: ${command}`);
+
+    if (quote === "\"") {
+      if (char === "\\") {
+        escape = true;
+        continue;
+      }
+      if (char === "\"") {
+        quote = null;
+        continue;
+      }
+      current += char;
+      continue;
     }
+
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+
+    if (char === "\\") {
+      escape = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += char;
   }
 
-  if (issues.length > 0) {
-    throw new Error(issues.join("; "));
+  if (current) {
+    args.push(current);
   }
+
+  return args;
 };
 
-const generatePlanFromRequirement = async (requirement: string): Promise<TaskPlan> => {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY is not set");
+const parsePlanFile = async (filePath: string): Promise<TaskPlan> => {
+  const raw = await fs.promises.readFile(filePath, "utf-8");
+  const lines = raw.split(/\r?\n/);
+  let planName = path.basename(filePath);
+  let nameFromHeading = false;
+  let inCodeBlock = false;
+  const steps: PlanStep[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) continue;
+
+    const headingMatch = trimmed.match(/^#+\s+(.*)$/);
+    if (headingMatch && !nameFromHeading) {
+      const heading = headingMatch[1].trim();
+      if (heading) {
+        planName = heading;
+        nameFromHeading = true;
+      }
+      continue;
+    }
+
+    const normalized = trimmed.replace(/^[-*]\s*/, "");
+    const match = normalized.match(/^(cmd|note|executor)\s*:\s*(.+)$/i);
+    if (match) {
+      const type = match[1].toLowerCase();
+      const value = match[2].trim();
+      if (!value) continue;
+      if (type === "cmd") {
+        steps.push({ type: "cmd", command: value });
+      } else if (type === "note") {
+        steps.push({ type: "note", message: value });
+      } else if (type === "executor") {
+        steps.push({ type: "executor", tool: "codex", instructions: value });
+      }
+      continue;
+    }
+
+    steps.push({ type: "note", message: normalized });
   }
 
-  const { summary, found } = await buildLastRunSummary();
-  console.log(`[planner] lastRunFound: ${found}`);
-  console.log(`[planner] lastRunSummaryLength: ${summary.length}`);
-  console.log(`[planner] capabilityCardLength: ${CAPABILITY_CARD.length}`);
-
-  const systemPrompt = await loadPlannerSystemPrompt();
-  const baseUserPrompt = [
-    CAPABILITY_CARD,
-    summary,
-    "Requirement:",
-    requirement.trim()
-  ].join("\n");
-
-  const retryHint =
-    "Reminder: cmd runner uses spawn(shell=false); do NOT output any shell operators. " +
-    "For git grep, exit 1 (no matches) is treated as success; do NOT append '|| true'.";
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const userPrompt = attempt === 0 ? baseUserPrompt : `${baseUserPrompt}\n${retryHint}`;
-    const response = await fetch(OPENAI_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ]
-      })
-    });
-
-    if (!response.ok) {
-      let message = `OpenAI API error (${response.status})`;
-      try {
-        const data = await response.json();
-        if (data?.error?.message) {
-          message = data.error.message;
-        }
-      } catch {
-        // keep fallback message
-      }
-      throw new Error(message);
-    }
-
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: unknown } }>;
-    };
-    const rawText = normalizePlannerContent(data?.choices?.[0]?.message?.content);
-    if (!rawText) {
-      throw new Error("OpenAI response missing content");
-    }
-
-    const rawPreview = previewText(rawText);
-    console.log(`[planner] raw output length: ${rawText.length}`);
-    console.log(`[planner] raw output preview: ${rawPreview}`);
-
-    let parsedJson: unknown;
-    let extractedJsonText = "";
-    try {
-      extractedJsonText = extractJsonFromText(rawText);
-      parsedJson = JSON.parse(extractedJsonText);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Planner JSON parse error: ${message}; rawPreview="${rawPreview}"`
-      );
-    }
-
-    try {
-      const plan = TaskPlanSchema.parse(parsedJson);
-      validateGeneratedPlan(plan);
-      if (planHasForbiddenCmdOps(plan)) {
-        if (attempt === 0) {
-          console.log("[planner] forbidden shell operators detected; retrying");
-          continue;
-        }
-        throw new Error(
-          "Planner output includes forbidden shell operators in cmd steps. Remove shell operators manually and retry."
-        );
-      }
-      return plan;
-    } catch (error) {
-      const extractedPreview = previewText(extractedJsonText);
-      const parsedPreview = previewText(
-        JSON.stringify(parsedJson ?? null)
-      );
-      if (error instanceof ZodError) {
-        throw new Error(
-          `Plan schema validation failed: ${formatZodError(error)}; rawPreview="${rawPreview}"; extractedPreview="${extractedPreview}"; parsedPreview="${parsedPreview}"`
-        );
-      }
-      throw error;
-    }
+  if (steps.length === 0) {
+    throw new Error(`Plan file has no steps: ${filePath}`);
   }
 
-  throw new Error("Planner failed to generate a valid plan");
+  return { plan_name: planName || "Plan", steps };
 };
 
 const runCommandCapture = (
@@ -593,40 +323,6 @@ const collectGitEvidence = async (
   return evidence;
 };
 
-const maybeRequestDecision = async (
-  evidence: Record<string, string> | { error: string },
-  runId: string,
-  runDir: string,
-  sender: WebContents,
-  outputStream: fs.WriteStream,
-  options: { awaitDecision: boolean }
-): Promise<"approved" | "rejected" | "pending" | null> => {
-  if ("error" in evidence) return null;
-  const nameOnly = evidence.git_diff_name_only;
-  if (!nameOnly) return null;
-
-  const changedFiles = parseNameOnly(nameOnly);
-  const dependencyFiles = matchDependencyFiles(changedFiles);
-  if (dependencyFiles.length === 0) return null;
-
-  appendSystemLog(
-    sender,
-    runId,
-    outputStream,
-    `Dependency changes detected. Awaiting approval: ${dependencyFiles.join(", ")}\n`
-  );
-  sender.send("run:decision", { runId, files: dependencyFiles });
-
-  if (!options.awaitDecision) {
-    pendingDecisions.set(runId, { runDir, files: dependencyFiles, resolve: () => {} });
-    return "pending";
-  }
-
-  return new Promise((resolve) => {
-    pendingDecisions.set(runId, { runDir, files: dependencyFiles, resolve });
-  });
-};
-
 const runCommandStreaming = (
   command: string,
   args: string[],
@@ -637,65 +333,65 @@ const runCommandStreaming = (
 ) =>
   new Promise<{ exitCode: number; cancelled: boolean; timedOut: boolean; stdout: string; stderr: string }>(
     (resolve) => {
-    const child = spawn(command, args, { cwd: workspacePath });
-    let stdout = "";
-    let stderr = "";
-    const timeoutId = setTimeout(() => {
-      if (!activeRun || activeRun.runId !== runId) return;
-      activeRun.timedOut = true;
-      appendSystemLog(sender, runId, outputStream, "[Timeout exceeded]\n");
-      terminateProcess(child, false);
-    }, RUN_TIMEOUT_MS);
+      const child = spawn(command, args, { cwd: workspacePath });
+      let stdout = "";
+      let stderr = "";
+      const timeoutId = setTimeout(() => {
+        if (!activeRun || activeRun.runId !== runId) return;
+        activeRun.timedOut = true;
+        appendSystemLog(sender, runId, outputStream, "[Timeout exceeded]\n");
+        terminateProcess(child, false);
+      }, RUN_TIMEOUT_MS);
 
-    activeRun = {
-      runId,
-      workspacePath,
-      command: `${command} ${args.join(" ")}`.trim(),
-      startTime: new Date().toISOString(),
-      runDir: "",
-      outputStream,
-      child,
-      timeoutId,
-      cancelled: false,
-      timedOut: false,
-      killGroup: false
-    };
+      activeRun = {
+        runId,
+        workspacePath,
+        command: `${command} ${args.join(" ")}`.trim(),
+        startTime: new Date().toISOString(),
+        runDir: "",
+        outputStream,
+        child,
+        timeoutId,
+        cancelled: false,
+        timedOut: false,
+        killGroup: false
+      };
 
-    const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
-      const text = chunk.toString();
-      if (source === "stdout") {
-        stdout += text;
-      } else {
-        stderr += text;
-      }
-      outputStream.write(text);
-      sender.send("run:output", { runId, source, text });
-    };
+      const sendChunk = (source: "stdout" | "stderr", chunk: Buffer) => {
+        const text = chunk.toString();
+        if (source === "stdout") {
+          stdout += text;
+        } else {
+          stderr += text;
+        }
+        outputStream.write(text);
+        sender.send("run:output", { runId, source, text });
+      };
 
-    child.stdout.on("data", (chunk) => sendChunk("stdout", chunk));
-    child.stderr.on("data", (chunk) => sendChunk("stderr", chunk));
+      child.stdout.on("data", (chunk) => sendChunk("stdout", chunk));
+      child.stderr.on("data", (chunk) => sendChunk("stderr", chunk));
 
-    child.on("close", (code) => {
-      if (activeRun?.runId === runId) {
-        clearTimeout(activeRun.timeoutId);
-      }
-      const cancelled = activeRun?.cancelled ?? false;
-      const timedOut = activeRun?.timedOut ?? false;
-      activeRun = null;
-      resolve({ exitCode: code ?? -1, cancelled, timedOut, stdout, stderr });
-    });
+      child.on("close", (code) => {
+        if (activeRun?.runId === runId) {
+          clearTimeout(activeRun.timeoutId);
+        }
+        const cancelled = activeRun?.cancelled ?? false;
+        const timedOut = activeRun?.timedOut ?? false;
+        activeRun = null;
+        resolve({ exitCode: code ?? -1, cancelled, timedOut, stdout, stderr });
+      });
 
-    child.on("error", (error) => {
-      if (activeRun?.runId === runId) {
-        clearTimeout(activeRun.timeoutId);
-      }
-      appendSystemLog(sender, runId, outputStream, `Command error: ${error.message}\n`);
-      const cancelled = activeRun?.cancelled ?? false;
-      const timedOut = activeRun?.timedOut ?? false;
-      activeRun = null;
-      resolve({ exitCode: -1, cancelled, timedOut, stdout, stderr });
-    });
-  }
+      child.on("error", (error) => {
+        if (activeRun?.runId === runId) {
+          clearTimeout(activeRun.timeoutId);
+        }
+        appendSystemLog(sender, runId, outputStream, `Command error: ${error.message}\n`);
+        const cancelled = activeRun?.cancelled ?? false;
+        const timedOut = activeRun?.timedOut ?? false;
+        activeRun = null;
+        resolve({ exitCode: -1, cancelled, timedOut, stdout, stderr });
+      });
+    }
   );
 
 const runExecutorCommand = (
@@ -771,183 +467,20 @@ const runExecutorStreaming = async (
   outputStream: fs.WriteStream
 ) => {
   const execArgs = ["exec", "-C", workspacePath, "--full-auto", instructions.trim()];
-  const execResult = await runExecutorCommand(
-    tool,
-    execArgs,
-    workspacePath,
-    runId,
-    sender,
-    outputStream
-  );
-  return execResult;
-};
-
-const buildRetryInstructions = () =>
-  [
-    "ONLY edit src/renderer/App.tsx.",
-    "Ensure that after applying changes, `git diff --name-only` is non-empty and includes src/renderer/App.tsx.",
-    "If the feature already exists, do not duplicate UI; make a minimal fix to behavior or wiring so a real diff is produced.",
-    "Do not add dependencies; do not modify package.json/lockfiles; do not run npm install."
-  ].join(" ");
-
-const diffFromBaseline = (baseline: string[], current: string[]) => {
-  const baselineSet = new Set(baseline);
-  return current.filter((file) => !baselineSet.has(file));
-};
-
-const parseStatusPorcelain = (value: string) =>
-  value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const cleaned = line.slice(3).trim();
-      if (!cleaned) return "";
-      if (cleaned.includes("->")) {
-        const parts = cleaned.split("->");
-        return parts[parts.length - 1].trim();
-      }
-      return cleaned;
-    })
-    .filter(Boolean);
-
-const planHasExecutor = (plan: TaskPlan) => plan.steps.some((step) => step.type === "executor");
-
-type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: JsonValue }
-  | JsonValue[];
-
-const toSerializable = (value: unknown): JsonValue => {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => toSerializable(item));
-  }
-  if (value instanceof Error) {
-    const errorRecord: { [key: string]: JsonValue } = {
-      name: value.name,
-      message: value.message
-    };
-    const anyError = value as { code?: unknown };
-    if (anyError.code) {
-      errorRecord.code = typeof anyError.code === "string" ? anyError.code : String(anyError.code);
-    }
-    return errorRecord;
-  }
-  if (value instanceof Map) {
-    return Array.from(value.entries()).map(([key, val]) => [String(key), toSerializable(val)]);
-  }
-  if (value instanceof Set) {
-    return Array.from(value.values()).map((val) => toSerializable(val));
-  }
-  if (typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    const result: { [key: string]: JsonValue } = {};
-    for (const [key, val] of Object.entries(obj)) {
-      result[key] = toSerializable(val);
-    }
-    return result;
-  }
-  return String(value);
-};
-
-const splitArgs = (command: string) => {
-  const args: string[] = [];
-  let current = "";
-  let quote: "'" | "\"" | null = null;
-  let escape = false;
-
-  for (let i = 0; i < command.length; i += 1) {
-    const char = command[i];
-
-    if (escape) {
-      current += char;
-      escape = false;
-      continue;
-    }
-
-    if (quote === "\"") {
-      if (char === "\\") {
-        escape = true;
-        continue;
-      }
-      if (char === "\"") {
-        quote = null;
-        continue;
-      }
-      current += char;
-      continue;
-    }
-
-    if (quote === "'") {
-      if (char === "'") {
-        quote = null;
-        continue;
-      }
-      current += char;
-      continue;
-    }
-
-    if (char === "'" || char === "\"") {
-      quote = char;
-      continue;
-    }
-
-    if (char === "\\") {
-      escape = true;
-      continue;
-    }
-
-    if (/\s/.test(char)) {
-      if (current) {
-        args.push(current);
-        current = "";
-      }
-      continue;
-    }
-
-    current += char;
-  }
-
-  if (current) {
-    args.push(current);
-  }
-
-  return args;
-};
-
-type RunPlanResult = {
-  runId: string;
-  exitCode: number;
-  cancelled: boolean;
-  cancelledByDecision: boolean;
-  blockedByPolicy: boolean;
-  timedOut: boolean;
-  decisionPending: boolean;
-  lastExecutorEvaluation: Record<string, unknown> | null;
+  return runExecutorCommand(tool, execArgs, workspacePath, runId, sender, outputStream);
 };
 
 const runPlanInternal = async (
   sender: WebContents,
-  payload: { workspacePath: string; plan: TaskPlan; requirement?: string },
-  options: { awaitDecision: boolean; runId?: string; allowDirtyVerifyOnly?: boolean }
-): Promise<RunPlanResult> => {
+  payload: { workspacePath: string; planPath?: string }
+): Promise<string> => {
   if (activePlan) {
     throw new Error("Another run is already active");
   }
 
-  const { workspacePath, plan, requirement } = payload;
+  const { workspacePath } = payload;
   if (!workspacePath) {
     throw new Error("Workspace not set");
-  }
-  if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
-    throw new Error("Plan is empty");
   }
 
   const isRepo = await isGitRepo(workspacePath);
@@ -955,7 +488,13 @@ const runPlanInternal = async (
     throw new Error("Not a git repository (no .git found)");
   }
 
-  const runId = options.runId ?? String(Date.now());
+  const planPath = payload.planPath?.trim() || "plan.md";
+  const resolvedPlanPath = path.isAbsolute(planPath)
+    ? planPath
+    : path.join(workspacePath, planPath);
+  const plan = await parsePlanFile(resolvedPlanPath);
+
+  const runId = String(Date.now());
   const startTime = new Date().toISOString();
   const runDir = await ensureRunDir(runId);
   const outputPath = path.join(runDir, "output.log");
@@ -975,67 +514,18 @@ const runPlanInternal = async (
     run_id: runId,
     workspacePath,
     startTime,
-    requirement: requirement ? requirement.trim() : "",
     plan: {
       name: plan.plan_name,
-      stepsCount: totalSteps
+      stepsCount: totalSteps,
+      source: resolvedPlanPath
     },
     steps: []
   };
-
-  const statusResult = await runCommandCapture(
-    "git",
-    ["status", "--porcelain"],
-    workspacePath
-  );
-  const dirtyFiles =
-    statusResult.code === 0 && statusResult.stdout
-      ? parseStatusPorcelain(statusResult.stdout)
-      : [];
-  const workspaceDirty = dirtyFiles.length > 0;
-  const verifyOnlyRequested = Boolean(options.allowDirtyVerifyOnly);
-  const effectiveVerifyOnly = workspaceDirty ? verifyOnlyRequested : false;
-  appendSystemLog(
-    sender,
-    runId,
-    outputStream,
-    `[verify-only] requested=${verifyOnlyRequested} effective=${effectiveVerifyOnly} dirty=${workspaceDirty}\n`
-  );
-  if (workspaceDirty) {
-    appendSystemLog(
-      sender,
-      runId,
-      outputStream,
-      `[guard] workspace dirty; ${dirtyFiles.length} file(s) changed\n`
-    );
-    runMeta.guard = {
-      workspace_dirty: true,
-      dirty_files: dirtyFiles
-    };
-    if (effectiveVerifyOnly && !planHasExecutor(plan)) {
-      runMeta.guard.allow_verify_only = true;
-      appendSystemLog(sender, runId, outputStream, "[guard] continue verify-only plan\n");
-      await writeRunMeta(runDir, runMeta);
-    } else {
-      runMeta.endTime = new Date().toISOString();
-      runMeta.exitCode = -1;
-      await writeRunMeta(runDir, runMeta);
-      outputStream.end();
-      activePlan = null;
-      const error = new Error("WorkspaceDirtyError: workspace has uncommitted changes");
-      error.name = "WorkspaceDirtyError";
-      throw error;
-    }
-  }
 
   let lastExitCode = 0;
   let blockedByPolicy = false;
   let timedOut = false;
   let cancelled = false;
-  let cancelledByDecision = false;
-  let decisionPending = false;
-  let lastExecutorEvaluation: Record<string, unknown> | null = null;
-  let lastPrecheckHit = false;
 
   for (let index = 0; index < plan.steps.length; index += 1) {
     if (activePlan.cancelled) {
@@ -1058,7 +548,6 @@ const runPlanInternal = async (
       stepMeta.ended_at = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
       await writeRunMeta(runDir, runMeta);
-      lastPrecheckHit = false;
       continue;
     }
 
@@ -1079,34 +568,10 @@ const runPlanInternal = async (
         stepMeta.ended_at = new Date().toISOString();
         (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
         await writeRunMeta(runDir, runMeta);
-        const decisionResult = await maybeRequestDecision(
-          evidence,
-          runId,
-          runDir,
-          sender,
-          outputStream,
-          options
-        );
-        if (decisionResult === "pending") {
-          decisionPending = true;
-          runMeta.decision_pending = true;
-        } else if (decisionResult) {
-          await mergeDecisionFromDisk(runDir, runMeta);
-        }
         break;
       }
 
-      const baselineResult = await runCommandCapture(
-        "git",
-        ["diff", "--name-only"],
-        workspacePath
-      );
-      const baselineFiles =
-        baselineResult.code === 0 && baselineResult.stdout
-          ? parseNameOnly(baselineResult.stdout)
-          : [];
-
-      let result = await runExecutorStreaming(
+      const result = await runExecutorStreaming(
         tool,
         step.instructions,
         workspacePath,
@@ -1121,91 +586,6 @@ const runPlanInternal = async (
         stepMeta.error = result.error;
       }
 
-      const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
-      let currentFiles: string[] = [];
-      if (!("error" in evidence) && typeof evidence.git_diff_name_only === "string") {
-        currentFiles = parseNameOnly(evidence.git_diff_name_only);
-      }
-      const changedFiles = diffFromBaseline(baselineFiles, currentFiles);
-      const hasChanges = changedFiles.length > 0;
-      const evaluation: Record<string, unknown> = {
-        baseline_files: baselineFiles,
-        current_files: currentFiles,
-        changed_files: changedFiles,
-        has_changes: hasChanges,
-        retried: false
-      };
-      if (result.exitCode === 0 && !hasChanges) {
-        evaluation.suspicious_no_change = true;
-      }
-      if (result.exitCode === 0 && lastPrecheckHit && !hasChanges) {
-        evaluation.no_op = true;
-      }
-      if (evaluation.no_op) {
-        appendSystemLog(
-          sender,
-          runId,
-          outputStream,
-          "[auto] no-op detected from precheck; skipping modification retry\n"
-        );
-        const grepResult = await runCommandCapture(
-          "git",
-          ["grep", "-n", "Clear Logs", "--", "src/renderer/App.tsx"],
-          workspacePath
-        );
-        if (grepResult.stdout) {
-          appendSystemLog(sender, runId, outputStream, grepResult.stdout);
-        }
-        if (grepResult.stderr) {
-          appendSystemLog(sender, runId, outputStream, grepResult.stderr);
-        }
-      } else if (evaluation.suspicious_no_change) {
-        evaluation.retried = true;
-        const retryInstructions = buildRetryInstructions();
-        const retryResult = await runExecutorStreaming(
-          tool,
-          retryInstructions,
-          workspacePath,
-          runId,
-          sender,
-          outputStream
-        );
-        let retryCurrent: string[] = [];
-        const retryDiff = await runCommandCapture(
-          "git",
-          ["diff", "--name-only"],
-          workspacePath
-        );
-        if (retryDiff.code === 0 && retryDiff.stdout) {
-          retryCurrent = parseNameOnly(retryDiff.stdout);
-        }
-        const retryChanged = diffFromBaseline(baselineFiles, retryCurrent);
-        const retryHasChanges = retryChanged.length > 0;
-        evaluation.retry_result = {
-          exit_code: retryResult.exitCode,
-          baseline_files: baselineFiles,
-          current_files: retryCurrent,
-          changed_files: retryChanged,
-          has_changes: retryHasChanges
-        };
-        if (!retryHasChanges) {
-          appendSystemLog(
-            sender,
-            runId,
-            outputStream,
-            "[auto] retry produced no changes; user attention may be required\n"
-          );
-        }
-
-        result = retryResult;
-        stepMeta.exit_code = retryResult.exitCode;
-        stepMeta.cancelled = retryResult.cancelled;
-        stepMeta.timeout = retryResult.timedOut;
-        if (retryResult.error) {
-          stepMeta.error = retryResult.error;
-        }
-      }
-
       if (result.cancelled) {
         cancelled = true;
         lastExitCode = result.exitCode;
@@ -1215,55 +595,16 @@ const runPlanInternal = async (
       } else {
         lastExitCode = result.exitCode;
       }
-      stepMeta.evaluation = evaluation;
-      lastExecutorEvaluation = evaluation;
-      appendSystemLog(
-        sender,
-        runId,
-        outputStream,
-        `[evaluation] changed_files=${changedFiles.join(", ") || "(none)"} suspicious_no_change=${Boolean(
-          evaluation.suspicious_no_change
-        )} no_op=${Boolean(evaluation.no_op)}\n`
-      );
-      const finalEvidence =
-        evaluation.retried === true
-          ? await collectGitEvidence(workspacePath, sender, runId, outputStream)
-          : evidence;
-      stepMeta.evidence = finalEvidence;
-      runMeta.evidence = finalEvidence;
+
+      const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
+      stepMeta.evidence = evidence;
+      runMeta.evidence = evidence;
       stepMeta.ended_at = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
       await writeRunMeta(runDir, runMeta);
-      lastPrecheckHit = false;
 
       if (result.cancelled || result.timedOut || result.exitCode !== 0) {
         break;
-      }
-
-      const decisionResult = await maybeRequestDecision(
-        finalEvidence,
-        runId,
-        runDir,
-        sender,
-        outputStream,
-        options
-      );
-      if (decisionResult === "pending") {
-        decisionPending = true;
-        runMeta.decision_pending = true;
-        break;
-      }
-      if (decisionResult) {
-        await mergeDecisionFromDisk(runDir, runMeta);
-        if (decisionResult === "rejected") {
-          cancelledByDecision = true;
-          break;
-        }
-        if (activePlan.cancelled) {
-          cancelled = true;
-          lastExitCode = -1;
-          break;
-        }
       }
       continue;
     }
@@ -1283,20 +624,6 @@ const runPlanInternal = async (
       stepMeta.ended_at = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
       await writeRunMeta(runDir, runMeta);
-      const decisionResult = await maybeRequestDecision(
-        evidence,
-        runId,
-        runDir,
-        sender,
-        outputStream,
-        options
-      );
-      if (decisionResult === "pending") {
-        decisionPending = true;
-        runMeta.decision_pending = true;
-      } else if (decisionResult) {
-        await mergeDecisionFromDisk(runDir, runMeta);
-      }
       break;
     }
 
@@ -1312,20 +639,6 @@ const runPlanInternal = async (
       stepMeta.ended_at = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
       await writeRunMeta(runDir, runMeta);
-      const decisionResult = await maybeRequestDecision(
-        evidence,
-        runId,
-        runDir,
-        sender,
-        outputStream,
-        options
-      );
-      if (decisionResult === "pending") {
-        decisionPending = true;
-        runMeta.decision_pending = true;
-      } else if (decisionResult) {
-        await mergeDecisionFromDisk(runDir, runMeta);
-      }
       break;
     }
 
@@ -1340,7 +653,7 @@ const runPlanInternal = async (
       await writeRunMeta(runDir, runMeta);
       break;
     }
-    appendSystemLog(sender, runId, outputStream, `[cmd] argv0=${bin} argc=${args.length}\n`);
+
     const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
     const stdout = result.stdout.trim();
     const isGrep = command.startsWith("git grep");
@@ -1349,12 +662,11 @@ const runPlanInternal = async (
     if (isGrepNoMatch) {
       appendSystemLog(sender, runId, outputStream, "[precheck] no matches\n");
     }
-    const isPrecheck =
-      command.startsWith("git grep") && command.includes("Clear Logs") && command.includes("src/renderer/App.tsx");
-    lastPrecheckHit = isPrecheck && Boolean(stdout);
+
     stepMeta.exit_code = result.exitCode;
     stepMeta.cancelled = result.cancelled;
     stepMeta.timeout = result.timedOut;
+    stepMeta.stdout = stdout;
 
     if (result.cancelled) {
       cancelled = true;
@@ -1376,59 +688,21 @@ const runPlanInternal = async (
     if (result.cancelled || result.timedOut || effectiveExitCode !== 0) {
       break;
     }
-
-    const decisionResult = await maybeRequestDecision(
-      evidence,
-      runId,
-      runDir,
-      sender,
-      outputStream,
-      options
-    );
-    if (decisionResult === "pending") {
-      decisionPending = true;
-      runMeta.decision_pending = true;
-      break;
-    }
-    if (decisionResult) {
-      await mergeDecisionFromDisk(runDir, runMeta);
-      if (decisionResult === "rejected") {
-        cancelledByDecision = true;
-        break;
-      }
-      if (activePlan.cancelled) {
-        cancelled = true;
-        lastExitCode = -1;
-        break;
-      }
-    }
   }
 
   const endTime = new Date().toISOString();
-  await mergeDecisionFromDisk(runDir, runMeta);
   runMeta.endTime = endTime;
   runMeta.exitCode = lastExitCode;
   if (blockedByPolicy) runMeta.blocked_by_policy = true;
   if (timedOut) runMeta.timeout = true;
   if (cancelled) runMeta.cancelled = true;
-  if (cancelledByDecision) runMeta.cancelled_by_decision = true;
-  if (decisionPending) runMeta.decision_pending = true;
 
   await writeRunMeta(runDir, runMeta);
   outputStream.end();
   sender.send("run:done", { runId, exitCode: lastExitCode });
 
   activePlan = null;
-  return {
-    runId,
-    exitCode: lastExitCode,
-    cancelled,
-    cancelledByDecision,
-    blockedByPolicy,
-    timedOut,
-    decisionPending,
-    lastExecutorEvaluation
-  };
+  return runId;
 };
 
 const registerIpc = () => {
@@ -1450,54 +724,14 @@ const registerIpc = () => {
     return runsRoot;
   });
 
-  ipcMain.handle("planner:generatePlan", async (_event, requirement: string) => {
-    if (!requirement || !requirement.trim()) {
-      throw new Error("Requirement is empty");
-    }
-    return generatePlanFromRequirement(requirement);
-  });
-
   ipcMain.handle(
     "run:plan",
-    async (
-      event,
-      payload: { workspacePath: string; plan: TaskPlan; requirement?: string; allowDirtyVerifyOnly?: boolean }
-    ) => {
+    async (event, payload: { workspacePath: string; planPath?: string }) => {
       try {
-        const result = await runPlanInternal(event.sender, payload, {
-          awaitDecision: true,
-          allowDirtyVerifyOnly: Boolean(payload.allowDirtyVerifyOnly)
-        });
-        return { ok: true, result: result.runId };
+        const result = await runPlanInternal(event.sender, payload);
+        return { ok: true, result };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (message.startsWith("WorkspaceDirtyError")) {
-          let dirtyFiles: string[] = [];
-          try {
-            const status = await runCommandCapture(
-              "git",
-              ["status", "--porcelain"],
-              payload.workspacePath
-            );
-            if (status.code === 0 && status.stdout) {
-              dirtyFiles = parseStatusPorcelain(status.stdout);
-            }
-          } catch {
-            // ignore status errors
-          }
-          return {
-            ok: false,
-            error: {
-              code: "WORKSPACE_DIRTY",
-              name: "WorkspaceDirtyError",
-              message: "Workspace has uncommitted changes",
-              details: {
-                dirty_files: dirtyFiles,
-                allow_verify_only_supported: true
-              }
-            }
-          };
-        }
         return {
           ok: false,
           error: {
@@ -1507,247 +741,8 @@ const registerIpc = () => {
           }
         };
       }
-    });
-
-  ipcMain.handle(
-    "autobuild:start",
-    async (event, payload: { workspace: string; requirement: string; maxIterations?: number }) => {
-      if (autobuildActive || activePlan) {
-        throw new Error("Another run is already active");
-      }
-      if (!payload.workspace) {
-        throw new Error("Workspace not set");
-      }
-      if (!payload.requirement || !payload.requirement.trim()) {
-        throw new Error("Requirement is empty");
-      }
-
-      autobuildActive = true;
-      autobuildCancelled = false;
-      const maxIterations = payload.maxIterations ?? 2;
-      let iterationsRun = 0;
-      let stopReason = "max_iterations_reached";
-      const perIterationSummary: Array<{
-        iteration: number;
-        plan_name: string;
-        run_id: string;
-        outcome: string;
-        evaluation_brief: string;
-      }> = [];
-
-      try {
-        for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
-          if (autobuildCancelled) {
-            stopReason = "cancelled";
-            break;
-          }
-
-          event.sender.send("autobuild:status", toSerializable({
-            iteration,
-            phase: "planning",
-            message: "Generating plan"
-          }));
-
-          let plan: TaskPlan;
-          try {
-            plan = await generatePlanFromRequirement(payload.requirement);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: `Planning failed: ${message}`
-            }));
-            stopReason = "planning_failed";
-            break;
-          }
-
-          event.sender.send(
-            "autobuild:plan",
-            toSerializable({ iteration, plan, plan_name: plan.plan_name })
-          );
-
-          if (autobuildCancelled) {
-            stopReason = "cancelled";
-            break;
-          }
-
-          const runId = String(Date.now());
-          event.sender.send("autobuild:status", toSerializable({
-            iteration,
-            phase: "running",
-            message: "Running plan",
-            run_id: runId
-          }));
-
-          let result: RunPlanResult;
-          try {
-            result = await runPlanInternal(
-              event.sender,
-              { workspacePath: payload.workspace, plan, requirement: payload.requirement },
-              { awaitDecision: false, runId }
-            );
-            iterationsRun += 1;
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            if (message.startsWith("WorkspaceDirtyError")) {
-              stopReason = "workspace_dirty";
-              perIterationSummary.push({
-                iteration,
-                plan_name: plan.plan_name,
-                run_id: runId,
-                outcome: "workspace_dirty",
-                evaluation_brief: ""
-              });
-              event.sender.send("autobuild:status", toSerializable({
-                iteration,
-                phase: "done",
-                message: "Workspace dirty; please commit or stash changes"
-              }));
-              break;
-            }
-            stopReason = "failed";
-            perIterationSummary.push({
-              iteration,
-              plan_name: plan.plan_name,
-              run_id: runId,
-              outcome: "failed",
-              evaluation_brief: ""
-            });
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: `Run failed: ${message}`
-            }));
-            break;
-          }
-          const evaluation = result.lastExecutorEvaluation;
-          const evaluationBrief = evaluation
-            ? [
-                `has_changes=${Boolean(evaluation.has_changes)}`,
-                `suspicious_no_change=${Boolean(evaluation.suspicious_no_change)}`,
-                `no_op=${Boolean(evaluation.no_op)}`,
-                `retried=${Boolean(evaluation.retried)}`,
-                `retry_has_changes=${Boolean(
-                  evaluation.retry_result
-                    ? (evaluation.retry_result as Record<string, unknown>).has_changes === true
-                    : false
-                )}`,
-                `changed_files=${Array.isArray(evaluation.changed_files)
-                  ? (evaluation.changed_files as string[]).slice(0, 5).join(", ") || "(none)"
-                  : "(none)"}`
-              ].join("; ")
-            : "";
-          perIterationSummary.push({
-            iteration,
-            plan_name: plan.plan_name,
-            run_id: result.runId,
-            outcome: "completed",
-            evaluation_brief: evaluationBrief
-          });
-
-          if (result.decisionPending) {
-            stopReason = "decision_pending";
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: "Decision pending, awaiting user input"
-            }));
-            perIterationSummary[perIterationSummary.length - 1].outcome = "decision_pending";
-            break;
-          }
-
-          if (result.cancelled) {
-            stopReason = "cancelled";
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: "Cancelled"
-            }));
-            perIterationSummary[perIterationSummary.length - 1].outcome = "cancelled";
-            break;
-          }
-
-          const noOp = evaluation?.no_op === true;
-          const suspiciousNoChange = evaluation?.suspicious_no_change === true;
-          const retried = evaluation?.retried === true;
-          const retryHasChanges = evaluation?.retry_result
-            ? (evaluation.retry_result as Record<string, unknown>).has_changes === true
-            : false;
-
-          if (noOp) {
-            stopReason = "no_op";
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: "No-op detected; please validate behavior"
-            }));
-            perIterationSummary[perIterationSummary.length - 1].outcome = "no_op";
-            break;
-          }
-
-          if (suspiciousNoChange && retried && !retryHasChanges) {
-            stopReason = "retry_no_change";
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: "Retry produced no changes; need more specific instructions"
-            }));
-            perIterationSummary[perIterationSummary.length - 1].outcome = "retry_no_change";
-            break;
-          }
-
-          if (result.exitCode !== 0) {
-            if (iteration < maxIterations) {
-              perIterationSummary[perIterationSummary.length - 1].outcome = "failed";
-              continue;
-            }
-            stopReason = "failed";
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: "Run failed"
-            }));
-            perIterationSummary[perIterationSummary.length - 1].outcome = "failed";
-            break;
-          }
-
-          if (iteration >= maxIterations) {
-            stopReason = "max_iterations_reached";
-            event.sender.send("autobuild:status", toSerializable({
-              iteration,
-              phase: "done",
-              message: "Max iterations reached"
-            }));
-            perIterationSummary[perIterationSummary.length - 1].outcome = "max_iterations_reached";
-            break;
-          }
-        }
-      } finally {
-        autobuildActive = false;
-        autobuildCancelled = false;
-      }
-
-      event.sender.send("autobuild:done", toSerializable({
-        stop_reason: stopReason,
-        iterations_run: iterationsRun,
-        per_iteration_summary: perIterationSummary
-      }));
-      return true;
     }
   );
-
-  ipcMain.handle("autobuild:cancel", async () => {
-    autobuildCancelled = true;
-    if (activePlan) {
-      activePlan.cancelled = true;
-      if (activeRun && activeRun.runId === activePlan.runId) {
-        activeRun.cancelled = true;
-        terminateProcess(activeRun.child, activeRun.killGroup);
-      }
-    }
-    return true;
-  });
 
   ipcMain.handle("run:cancel", async (event, runId: string) => {
     if (!activePlan || activePlan.runId !== runId) {
@@ -1759,34 +754,9 @@ const registerIpc = () => {
       activeRun.cancelled = true;
       terminateProcess(activeRun.child, activeRun.killGroup);
     }
-    const pending = pendingDecisions.get(runId);
-    if (pending) {
-      pending.resolve("rejected");
-      pendingDecisions.delete(runId);
-    }
     event.sender.send("run:cancelled", { runId });
     return true;
   });
-
-  ipcMain.handle(
-    "run:decision",
-    async (_event, payload: { runId: string; result: "approved" | "rejected" }) => {
-      const pending = pendingDecisions.get(payload.runId);
-      if (!pending) return false;
-      const runPath = path.join(pending.runDir, "run.json");
-      const existing = JSON.parse(await fs.promises.readFile(runPath, "utf-8"));
-      const decision = {
-        type: "dependency_change",
-        result: payload.result,
-        timestamp: new Date().toISOString(),
-        files: pending.files
-      };
-      await writeRunMeta(pending.runDir, { ...existing, decision });
-      pending.resolve(payload.result);
-      pendingDecisions.delete(payload.runId);
-      return true;
-    }
-  );
 };
 
 app.whenReady().then(() => {

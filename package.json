@@ -6,14 +6,13 @@
   "type": "commonjs",
   "scripts": {
     "dev": "concurrently -k \"tsc -p tsconfig.json --watch --preserveWatchOutput\" \"vite\" \"wait-on dist/main/main.js dist/main/preload.js tcp:5173 && electron .\"",
-    "build": "tsc -p tsconfig.json && vite build && node scripts/copy-planner-prompt.js",
+    "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
     "better-sqlite3": "^9.4.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "zod": "^3.23.8"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@types/node": "^22.13.0",
