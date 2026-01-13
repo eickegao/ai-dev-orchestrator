@@ -25,8 +25,8 @@ const createWindow = () => {
   }
 };
 
-const RUN_TIMEOUT_MS = 30_000;
-const ALLOWED_COMMAND_PREFIXES = ["git"];
+const RUN_TIMEOUT_MS = 60_000;
+const ALLOWED_COMMAND_PREFIXES = ["git", "npm", "pnpm", "yarn", "node", "python", "dotnet", "flutter"];
 const ALLOWED_EXECUTOR_TOOLS = new Set(["codex"]);
 
 const getRunsRoot = () => path.join(app.getPath("userData"), "ai-dev-orchestrator", "data", "runs");
@@ -48,7 +48,7 @@ const isGitRepo = async (workspacePath: string) => {
 };
 
 const isCommandAllowed = (command: string) =>
-  ALLOWED_COMMAND_PREFIXES.some((prefix) => command.startsWith(prefix));
+  ALLOWED_COMMAND_PREFIXES.some((prefix) => new RegExp(`^${prefix}(\\s|$)`).test(command));
 
 const isExecutorToolAllowed = (tool: string) => ALLOWED_EXECUTOR_TOOLS.has(tool);
 
@@ -250,6 +250,8 @@ const parsePlanFile = async (filePath: string): Promise<TaskPlan> => {
 
   return { plan_name: planName || "Plan", steps };
 };
+
+const getPlanPath = (workspacePath: string) => path.join(workspacePath, "plan.md");
 
 const runCommandCapture = (
   command: string,
@@ -519,6 +521,9 @@ const runPlanInternal = async (
       stepsCount: totalSteps,
       source: resolvedPlanPath
     },
+    plan_path: resolvedPlanPath,
+    steps_total: totalSteps,
+    steps_executed: 0,
     steps: []
   };
 
@@ -526,6 +531,7 @@ const runPlanInternal = async (
   let blockedByPolicy = false;
   let timedOut = false;
   let cancelled = false;
+  let stepsExecuted = 0;
 
   for (let index = 0; index < plan.steps.length; index += 1) {
     if (activePlan.cancelled) {
@@ -540,13 +546,17 @@ const runPlanInternal = async (
     const stepMeta: Record<string, unknown> = {
       step_index: index + 1,
       type: step.type,
-      started_at: new Date().toISOString()
+      start_time: new Date().toISOString()
     };
 
     if (step.type === "note") {
       appendSystemLog(sender, runId, outputStream, `Note: ${step.message}\n`);
-      stepMeta.ended_at = new Date().toISOString();
+      stepMeta.command = `note: ${step.message}`;
+      stepMeta.exit_code = 0;
+      stepMeta.end_time = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      stepsExecuted += 1;
+      runMeta.steps_executed = stepsExecuted;
       await writeRunMeta(runDir, runMeta);
       continue;
     }
@@ -559,14 +569,17 @@ const runPlanInternal = async (
       if (!isExecutorToolAllowed(tool)) {
         appendSystemLog(sender, runId, outputStream, "Executor tool not allowed by policy\n");
         stepMeta.blocked_by_policy = true;
+        stepMeta.command = `executor:${tool}`;
         stepMeta.exit_code = -1;
         blockedByPolicy = true;
         lastExitCode = -1;
         const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
         stepMeta.evidence = evidence;
         runMeta.evidence = evidence;
-        stepMeta.ended_at = new Date().toISOString();
+        stepMeta.end_time = new Date().toISOString();
         (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+        stepsExecuted += 1;
+        runMeta.steps_executed = stepsExecuted;
         await writeRunMeta(runDir, runMeta);
         break;
       }
@@ -579,6 +592,7 @@ const runPlanInternal = async (
         sender,
         outputStream
       );
+      stepMeta.command = `executor:${tool}`;
       stepMeta.exit_code = result.exitCode;
       stepMeta.cancelled = result.cancelled;
       stepMeta.timeout = result.timedOut;
@@ -599,8 +613,10 @@ const runPlanInternal = async (
       const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
       stepMeta.evidence = evidence;
       runMeta.evidence = evidence;
-      stepMeta.ended_at = new Date().toISOString();
+      stepMeta.end_time = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      stepsExecuted += 1;
+      runMeta.steps_executed = stepsExecuted;
       await writeRunMeta(runDir, runMeta);
 
       if (result.cancelled || result.timedOut || result.exitCode !== 0) {
@@ -621,8 +637,10 @@ const runPlanInternal = async (
       const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
       stepMeta.evidence = evidence;
       runMeta.evidence = evidence;
-      stepMeta.ended_at = new Date().toISOString();
+      stepMeta.end_time = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      stepsExecuted += 1;
+      runMeta.steps_executed = stepsExecuted;
       await writeRunMeta(runDir, runMeta);
       break;
     }
@@ -636,8 +654,10 @@ const runPlanInternal = async (
       const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
       stepMeta.evidence = evidence;
       runMeta.evidence = evidence;
-      stepMeta.ended_at = new Date().toISOString();
+      stepMeta.end_time = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      stepsExecuted += 1;
+      runMeta.steps_executed = stepsExecuted;
       await writeRunMeta(runDir, runMeta);
       break;
     }
@@ -648,12 +668,15 @@ const runPlanInternal = async (
       appendSystemLog(sender, runId, outputStream, "Command parse failed\n");
       stepMeta.exit_code = -1;
       lastExitCode = -1;
-      stepMeta.ended_at = new Date().toISOString();
+      stepMeta.end_time = new Date().toISOString();
       (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+      stepsExecuted += 1;
+      runMeta.steps_executed = stepsExecuted;
       await writeRunMeta(runDir, runMeta);
       break;
     }
 
+    appendSystemLog(sender, runId, outputStream, `--- cmd begin: ${command} ---\n`);
     const result = await runCommandStreaming(bin, args, workspacePath, runId, sender, outputStream);
     const stdout = result.stdout.trim();
     const isGrep = command.startsWith("git grep");
@@ -662,6 +685,7 @@ const runPlanInternal = async (
     if (isGrepNoMatch) {
       appendSystemLog(sender, runId, outputStream, "[precheck] no matches\n");
     }
+    appendSystemLog(sender, runId, outputStream, `--- cmd end: ${command} exit=${result.exitCode} ---\n`);
 
     stepMeta.exit_code = result.exitCode;
     stepMeta.cancelled = result.cancelled;
@@ -681,8 +705,10 @@ const runPlanInternal = async (
     const evidence = await collectGitEvidence(workspacePath, sender, runId, outputStream);
     stepMeta.evidence = evidence;
     runMeta.evidence = evidence;
-    stepMeta.ended_at = new Date().toISOString();
+    stepMeta.end_time = new Date().toISOString();
     (runMeta.steps as Record<string, unknown>[]).push(stepMeta);
+    stepsExecuted += 1;
+    runMeta.steps_executed = stepsExecuted;
     await writeRunMeta(runDir, runMeta);
 
     if (result.cancelled || result.timedOut || effectiveExitCode !== 0) {
@@ -693,9 +719,21 @@ const runPlanInternal = async (
   const endTime = new Date().toISOString();
   runMeta.endTime = endTime;
   runMeta.exitCode = lastExitCode;
+  runMeta.steps_executed = stepsExecuted;
   if (blockedByPolicy) runMeta.blocked_by_policy = true;
   if (timedOut) runMeta.timeout = true;
   if (cancelled) runMeta.cancelled = true;
+  if (blockedByPolicy) {
+    runMeta.status = "blocked";
+  } else if (cancelled) {
+    runMeta.status = "cancelled";
+  } else if (timedOut) {
+    runMeta.status = "timeout";
+  } else if (lastExitCode === 0) {
+    runMeta.status = "success";
+  } else {
+    runMeta.status = "failed";
+  }
 
   await writeRunMeta(runDir, runMeta);
   outputStream.end();
@@ -722,6 +760,31 @@ const registerIpc = () => {
     const runsRoot = getRunsRoot();
     await fs.promises.mkdir(runsRoot, { recursive: true });
     return runsRoot;
+  });
+
+  ipcMain.handle("plan:exists", async (_event, workspacePath: string) => {
+    if (!workspacePath) return false;
+    try {
+      await fs.promises.access(getPlanPath(workspacePath));
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  ipcMain.handle("plan:createSample", async (_event, workspacePath: string) => {
+    if (!workspacePath) {
+      throw new Error("Workspace not set");
+    }
+    const planPath = getPlanPath(workspacePath);
+    const sample = [
+      "note: Sample plan",
+      "cmd: git status -sb",
+      "cmd: git diff --stat",
+      ""
+    ].join("\n");
+    await fs.promises.writeFile(planPath, sample, "utf-8");
+    return { created: true, path: planPath };
   });
 
   ipcMain.handle(

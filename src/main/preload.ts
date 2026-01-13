@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("appInfo", {
 
 contextBridge.exposeInMainWorld("api", {
   selectWorkspace: async () => ipcRenderer.invoke("workspace:select"),
+  checkPlanExists: async (workspacePath: string) => ipcRenderer.invoke("plan:exists", workspacePath),
+  createSamplePlan: async (workspacePath: string) => ipcRenderer.invoke("plan:createSample", workspacePath),
   runPlan: async (payload: { workspacePath: string; planPath?: string }) =>
     ipcRenderer.invoke("run:plan", payload) as Promise<
       | { ok: true; result: string }

@@ -18,6 +18,7 @@ const App = () => {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [stepProgress, setStepProgress] = useState<{ current: number; total: number } | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [planExists, setPlanExists] = useState<boolean | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const appendLog = (entry: LogEntry) => {
@@ -51,6 +52,14 @@ const App = () => {
     }
     if (!window.api) {
       setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
+    if (planExists === false) {
+      appendLog({
+        id: `${Date.now()}-plan-missing`,
+        text: "No plan.md found.\n",
+        source: "system"
+      });
       return;
     }
 
@@ -102,6 +111,37 @@ const App = () => {
       appendLog({
         id: `${Date.now()}-cancel-failed`,
         text: "Cancel failed (no active run).\n",
+        source: "system"
+      });
+    }
+  };
+
+  const createSamplePlan = async () => {
+    if (!workspacePath) {
+      appendLog({
+        id: `${Date.now()}-plan-create-error`,
+        text: "Workspace not set.\n",
+        source: "system"
+      });
+      return;
+    }
+    if (!window.api) {
+      setApiError("preload not loaded, IPC unavailable");
+      return;
+    }
+    try {
+      const result = await window.api.createSamplePlan(workspacePath);
+      setPlanExists(true);
+      appendLog({
+        id: `${Date.now()}-plan-created`,
+        text: `Created sample plan at ${result.path}\n`,
+        source: "system"
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendLog({
+        id: `${Date.now()}-plan-create-error`,
+        text: `Failed to create plan.md: ${message}\n`,
         source: "system"
       });
     }
@@ -162,6 +202,23 @@ const App = () => {
   }, []);
 
   useEffect(() => {
+    if (!window.api) {
+      return;
+    }
+    let isMounted = true;
+    if (workspacePath) {
+      window.api.checkPlanExists(workspacePath).then((exists) => {
+        if (isMounted) setPlanExists(exists);
+      });
+    } else if (isMounted) {
+      setPlanExists(null);
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [workspacePath]);
+
+  useEffect(() => {
     if (!logRef.current) return;
     logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logEntries]);
@@ -179,12 +236,18 @@ const App = () => {
             Step: {stepProgress ? `${stepProgress.current}/${stepProgress.total}` : "(idle)"}
           </p>
           <p className="muted">Plan file: {PLAN_FILENAME}</p>
+          {planExists === false && <p className="error">No plan.md found</p>}
           {apiError && <p className="error">{apiError}</p>}
         </div>
         <div className="actions">
           <button className="secondary" onClick={selectWorkspace}>
             Select Workspace
           </button>
+          {planExists === false && (
+            <button className="secondary" onClick={createSamplePlan} disabled={isRunning}>
+              Create Sample Plan
+            </button>
+          )}
           <button className="primary" onClick={runPlan} disabled={isRunning}>
             Run Plan
           </button>

@@ -8,6 +8,8 @@ declare global {
     };
     api?: {
       selectWorkspace: () => Promise<string | null>;
+      checkPlanExists: (workspacePath: string) => Promise<boolean>;
+      createSamplePlan: (workspacePath: string) => Promise<{ created: boolean; path: string }>;
       runPlan: (payload: { workspacePath: string; planPath?: string }) => Promise<
         | { ok: true; result: string }
         | {
